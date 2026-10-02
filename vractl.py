@@ -12,7 +12,8 @@ Servidor i autenticació:
   'vractl.py login' obté un token nou amb usuari i contrasenya i el desa al fitxer.
 
 TLS:
-  VRA_CA_FILE / --ca-file   CA (o cadena) per verificar el servidor, si no és de confiança pel sistema
+  VRA_CA_FILE / --ca-file   certificats PEM addicionals (p.ex. l'intermedi que el servidor no envia);
+                            s'afegeixen a les CA del sistema, no les substitueixen
   VRA_INSECURE=1            no verifica TLS (només proves; el token s'envia sense verificar el servidor)
 
 Diverses VM: es poden indicar totes les que es vulguin (nom o id). Per defecte s'actua sobre una
@@ -147,10 +148,14 @@ def make_ssl_context(ca_file):
     if os.environ.get("VRA_INSECURE") == "1":
         print("AVÍS: VRA_INSECURE=1 -> no es verifica el certificat del servidor.", file=sys.stderr)
         return ssl._create_unverified_context()
-    try:
-        return ssl.create_default_context(cafile=ca_file or os.environ.get("VRA_CA_FILE"))
-    except OSError as e:
-        sys.exit(f"No puc llegir el fitxer de CA: {e.strerror}")
+    ctx = ssl.create_default_context()  # CA del sistema
+    extra = ca_file or os.environ.get("VRA_CA_FILE")
+    if extra:  # s'afegeix a les del sistema (p.ex. un intermedi que el servidor no envia)
+        try:
+            ctx.load_verify_locations(cafile=os.path.expanduser(extra))
+        except (OSError, ssl.SSLError) as e:
+            sys.exit(f"No puc carregar el fitxer de CA ({extra}): {getattr(e, 'strerror', None) or e}")
+    return ctx
 
 
 CERT_HINT = (
@@ -370,7 +375,8 @@ def run():
     ap = argparse.ArgumentParser(description="Gestió de VMs d'Aria Automation", add_help=False)
     ap.add_argument("--help", action="help", help="mostra aquesta ajuda i surt")
     ap.add_argument("-h", "--host", metavar="HOST", help="servidor d'Aria Automation (o VRA_HOST)")
-    ap.add_argument("--ca-file", metavar="FITXER", help="CA/cadena per verificar el servidor (o VRA_CA_FILE)")
+    ap.add_argument("--ca-file", metavar="FITXER",
+                    help="certificats PEM addicionals de confiança, p.ex. un intermedi que falta (o VRA_CA_FILE)")
     ap.add_argument("--api-version", default=os.environ.get("VRA_API_VERSION", DEFAULT_API_VERSION),
                     metavar="AAAA-MM-DD", help=f"versió de la IaaS API (defecte: {DEFAULT_API_VERSION})")
     ap.add_argument("--match", action="append", metavar="PATRÓ",

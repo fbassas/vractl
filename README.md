@@ -80,7 +80,22 @@ El script **verifica el certificat del servidor**. Si el servidor no envia el ce
 com *"No es pot verificar el certificat del servidor"*. Solucions, per ordre de preferència:
 
 1. Que els administradors del servidor configurin la **cadena completa**.
-2. Indicar al script una CA/cadena amb l'intermedi que falta: `--ca-file ruta.pem` o `VRA_CA_FILE`.
+2. Indicar al script el certificat intermedi que falta: `--ca-file ruta.pem` o `VRA_CA_FILE`. El
+   fitxer (PEM) s'**afegeix** a les CA del sistema, no les substitueix, així que només cal l'intermedi.
+   L'URL per baixar-lo és al camp *Authority Information Access* del certificat del servidor:
+
+   ```bash
+   echo | openssl s_client -connect vra.example.org:443 -servername vra.example.org 2>/dev/null \
+     | openssl x509 -noout -ext authorityInfoAccess          # 'CA Issuers - URI:...'
+   mkdir -p ca && curl -o ca/intermedi.cer <URI>
+   openssl x509 -inform DER -in ca/intermedi.cer -out ca/intermedi.pem   # si és DER (si ja és PEM, copieu-lo)
+   # Comproveu-ho abans de fer-lo servir (la descàrrega és per HTTP; la verificació la valida):
+   echo | openssl s_client -connect vra.example.org:443 -servername vra.example.org 2>/dev/null \
+     | openssl x509 > fulla.pem && openssl verify -untrusted ca/intermedi.pem fulla.pem   # ha de dir OK
+   ./vractl.py -h vra.example.org --ca-file ca/intermedi.pem check
+   ```
+
+   Per no repetir-ho, definiu `VRA_CA_FILE` a l'entorn. El directori `ca/` està ignorat per git.
 3. `VRA_INSECURE=1` desactiva la verificació (el script ho avisa a cada execució). **Només per
    proves:** el token s'envia sense comprovar qui hi ha a l'altre costat.
 
@@ -91,7 +106,7 @@ com *"No es pot verificar el certificat del servidor"*. Solucions, per ordre de 
 | `VRA_HOST` | Servidor (alternativa a `-h`). |
 | `VRA_TOKEN` | Token d'API. |
 | `VRA_TOKEN_FILE` | Fitxer amb el token (defecte: `~/.config/vractl/token`). |
-| `VRA_CA_FILE` | CA/cadena per verificar el servidor (alternativa a `--ca-file`). |
+| `VRA_CA_FILE` | Certificats PEM addicionals de confiança, p.ex. un intermedi (alternativa a `--ca-file`). |
 | `VRA_INSECURE` | `1` desactiva la verificació TLS. **Només per proves.** |
 | `VRA_USER` | Usuari per a `login` (si no, el demana). |
 | `VRA_API_VERSION` | Versió de la IaaS API (defecte `2021-07-15`; alternativa a `--api-version`). |

@@ -24,3 +24,6 @@ token
 
 # Llistes de VMs locals (poden contenir noms interns)
 vms.txt
+
+# Certificats de CA locals (intermedis descarregats)
+ca/
