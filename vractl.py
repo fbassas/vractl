@@ -357,6 +357,34 @@ def match_vm(vm, pattern):
 
 
 # Amb --keep, el nom donat és un prefix i s'hi afegeix un sufix de data, que ordena cronològicament.
+def snapshot_limit(vm):
+    """Límit de snapshots de la VM (propietat 'snapshotLimit', un text), o None si no en té."""
+    try:
+        limit = int((vm.get("customProperties") or {}).get("snapshotLimit"))
+    except (TypeError, ValueError):
+        return None
+    return limit if limit > 0 else None
+
+
+def keep_warnings(vm, n_existing, keep):
+    """Avisos sobre --keep per a una VM amb límit de snapshots (llista, buida si tot va bé).
+
+    --keep crea primer el snapshot nou i després esborra els antics, així que durant un instant la
+    VM en té un més que el final: amb el límit ja assolit, la creació falla.
+    """
+    limit = snapshot_limit(vm)
+    if limit is None:
+        return []
+    out = []
+    if keep > limit:
+        out.append(f"--keep {keep} supera el límit de snapshots d'aquesta VM ({limit}): "
+                   f"com a molt se'n podran conservar {limit}.")
+    if n_existing >= limit:
+        out.append(f"la VM té {n_existing} snapshot(s) i el límit és {limit}: probablement la creació del "
+                   "nou fallarà, perquè --keep esborra els antics després de crear-lo.")
+    return out
+
+
 def prune_snapshots(vra, vm, prefix, keep, label=""):
     """Esborra els snapshots '<prefix>-AAAAMMDD-HHMMSS' més antics, deixant-ne `keep`."""
     pat = re.compile(re.escape(prefix) + r"-\d{8}-\d{6}$")
@@ -509,7 +537,7 @@ def run():
                 return True
             if a.cmd == "snapshots":
                 lines = [f"{'*' if s.get('isCurrent') else ' '} {s.get('name', ''):<32} "
-                         f"{s.get('createdAt', '')[:19]}  {s.get('description', '')}"
+                         f"{s.get('createdAt', '')[:19]:<10}  {s.get('id', ''):<36}  {s.get('description', '')}"
                          for s in vra.snapshots(vm["id"])]
                 if many:
                     lines.insert(0, f"== {label}")
@@ -527,6 +555,10 @@ def run():
                 method, path = "POST", f"{base}/operations/revert/{vra.snapshot_id(vm, a.name)}"
             elif a.cmd == "delsnap":
                 method, path = "DELETE", f"{base}/snapshots/{vra.snapshot_id(vm, a.name)}"
+
+            if a.cmd == "snapshot" and keep is not None and snapshot_limit(vm) is not None:
+                for w in keep_warnings(vm, len(vra.snapshots(vm["id"])), keep):
+                    say(f"{prefix}AVÍS {label}: {w}", err=True)
 
             tracker = vra.run(method, path, body, wait=not a.no_wait)
             if a.no_wait:

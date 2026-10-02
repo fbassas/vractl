@@ -128,7 +128,7 @@ com *"No es pot verificar el certificat del servidor"*. Solucions, per ordre de 
 ./vractl.py snapshot web01 pre-update --desc "abans d'actualitzar"
 ./vractl.py snapshot web01 amb-ram --memory        # inclou la memòria
 ./vractl.py snapshot web01 nocturn --keep 2        # rotació: en conserva els 2 més recents
-./vractl.py snapshots web01                        # llistar (* = snapshot actual)
+./vractl.py snapshots web01                        # llistar, amb id (* = snapshot actual)
 ./vractl.py rollback web01 pre-update              # revertir
 ./vractl.py delsnap web01 pre-update               # esborrar
 ```
@@ -210,8 +210,27 @@ reben el mateix nom i cada una es rota pel seu compte.
 ./vractl.py snapshot web01 nocturn --keep 7        # per a cron: 0 2 * * * /ruta/vractl.py ...
 ```
 
-Un snapshot també es pot indicar per **id** a `rollback` i `delsnap` (cal si dos tenen el mateix nom,
-cosa que vSphere permet).
+Un snapshot també es pot indicar per **id** a `rollback` i `delsnap`. Cal si dos snapshots tenen el
+mateix nom, cosa que vSphere permet: el script ho detecta, no fa res i us demana l'id. `snapshots` el
+mostra a la tercera columna:
+
+```
+* abans-update              2026-01-15  33333333-aaaa-bbbb-cccc-000000000001  descripció
+  abans-update              2026-01-08  44444444-aaaa-bbbb-cccc-000000000002  descripció
+```
+
+**Límit de snapshots.** Algunes VMs porten la propietat `snapshotLimit` (p. ex. 1). Com que `--keep`
+crea primer el snapshot nou i **després** esborra els antics, en una VM que ja és al límit la creació
+probablement fallarà. Abans de crear-lo, `--keep` **avisa** (per stderr, sense aturar-se) si la VM
+ja és al límit o si el `--keep` demanat el supera:
+
+```
+AVÍS web-prod (vm-0012): la VM té 1 snapshot(s) i el límit és 1: probablement la creació del nou
+fallarà, perquè --keep esborra els antics després de crear-lo.
+```
+
+Només és un avís: no s'ha comprovat com aplica el límit el vostre Aria Automation. En aquests
+casos, esborreu el snapshot antic a mà (`delsnap`) abans de tornar a crear-ne un.
 
 ## Permisos i notes
 
