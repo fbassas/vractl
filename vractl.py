@@ -16,10 +16,13 @@ TLS:
                             s'afegeixen a les CA del sistema, no les substitueixen
   VRA_INSECURE=1            no verifica TLS (només proves; el token s'envia sense verificar el servidor)
 
-Diverses VM: es poden indicar totes les que es vulguin (nom o id). Per defecte s'actua sobre una
-darrere l'altra; amb --parallel N, fins a N alhora. També es poden seleccionar per patró
-(--match 'web-*', es pot repetir) o per fitxer (--vms-file, un nom o id per línia). Tot es pot
-combinar; van abans del subcomandament.
+Identificació: les VMs s'indiquen pel nom del deployment (el més descriptiu; si en té diverses,
+se seleccionen totes), pel nom de la VM o per l'id. 'list' mostra les tres coses.
+
+Diverses VM: es poden indicar totes les que es vulguin. Per defecte s'actua sobre una darrere
+l'altra; amb --parallel N, fins a N alhora. També es poden seleccionar per patró (--match 'web*';
+coincideix amb el deployment o la VM; es pot repetir) o per fitxer (--vms-file, una VM per línia).
+Tot es pot combinar; van abans del subcomandament.
 
 Exemples:
   vractl.py -h vra.example.org login
@@ -247,15 +250,27 @@ class Vra:
 
     # --- API ----------------------------------------------------------------------------------
 
-    def machines(self):
+    def _paginate(self, path):
         out, skip = [], 0
         while True:
-            r = self._request("GET", "/iaas/api/machines", query={"$top": PAGE_SIZE, "$skip": skip}) or {}
+            r = self._request("GET", path, query={"$top": PAGE_SIZE, "$skip": skip}) or {}
             page = r.get("content", [])
             out += page
             skip += len(page)
             if not page or len(page) < PAGE_SIZE or skip >= r.get("totalElements", skip + 1):
                 return out
+
+    def machines(self):
+        """VMs visibles. Cada una porta 'deploymentName': el nom del deployment al qual pertany."""
+        ms = self._paginate("/iaas/api/machines")
+        try:
+            dep_names = {d["id"]: d.get("name") for d in self._paginate("/iaas/api/deployments")}
+        except VraError as e:
+            say(f"Avís: no puc llegir els deployments ({e}); s'usen els noms de VM.", err=True)
+            dep_names = {}
+        for m in ms:
+            m["deploymentName"] = dep_names.get(m.get("deploymentId")) or m.get("name")
+        return ms
 
     def snapshots(self, machine_id):
         r = self._request("GET", f"/iaas/api/machines/{machine_id}/snapshots") or []
@@ -264,21 +279,30 @@ class Vra:
     def find_all(self, idents, patterns=()):
         """Resol noms/ids i patrons en una sola consulta. Tot o res: si un falla, no es fa res.
 
-        Primer van les VMs indicades explícitament (en ordre) i després les dels patrons (per nom).
+        Un identificador és, per ordre, el nom d'un deployment (selecciona totes les seves VMs), el
+        nom d'una VM o l'id d'una VM. Primer van les indicades explícitament (en ordre) i després
+        les dels patrons (per nom de deployment).
         """
         vms = self.machines()
         found, errors = {}, []
         for ident in idents:
-            hits = [v for v in vms if v["id"] == ident or v.get("name") == ident]
+            by_dep = [v for v in vms if v["deploymentName"] == ident]
+            by_name = [v for v in vms if v.get("name") == ident]
+            by_id = [v for v in vms if v["id"] == ident]
+            if by_dep and by_name and {v["id"] for v in by_dep} != {v["id"] for v in by_name}:
+                errors.append(f"'{ident}' és ambigu: és el nom d'un deployment i també d'una altra VM "
+                              f"(ids {[v['id'] for v in by_name]}). Feu servir l'id.")
+                continue
+            hits = by_dep or by_name or by_id
             if not hits:
-                errors.append(f"No trobo cap VM amb nom o id '{ident}'")
-            elif len(hits) > 1:
+                errors.append(f"No trobo cap deployment, VM ni id '{ident}'")
+            elif not by_dep and len(hits) > 1:
                 errors.append(f"'{ident}' és ambigu: ids {[v['id'] for v in hits]}. Feu servir l'id.")
             else:
-                found.setdefault(hits[0]["id"], hits[0])  # sense duplicats, mantenint l'ordre
+                for v in hits:
+                    found.setdefault(v["id"], v)  # sense duplicats, mantenint l'ordre
         for pat in patterns:
-            hits = [v for v in sorted(vms, key=lambda v: v.get("name", ""))
-                    if fnmatch.fnmatchcase(v.get("name", ""), pat)]
+            hits = [v for v in sorted(vms, key=lambda v: v["deploymentName"]) if match_vm(v, pat)]
             if not hits:
                 errors.append(f"Cap VM coincideix amb el patró '{pat}'")
             for v in hits:
@@ -321,6 +345,17 @@ class Vra:
         return tracker
 
 
+def vm_label(vm):
+    """Nom d'una VM per a missatges: el del deployment i, si és diferent, el de la VM entre parèntesis."""
+    dep, name = vm.get("deploymentName"), vm.get("name")
+    return dep if dep == name else f"{dep} ({name})"
+
+
+def match_vm(vm, pattern):
+    """Un patró coincideix amb el nom del deployment o amb el de la VM (distingeix majúscules)."""
+    return any(fnmatch.fnmatchcase(vm.get(k) or "", pattern) for k in ("deploymentName", "name"))
+
+
 # Amb --keep, el nom donat és un prefix i s'hi afegeix un sufix de data, que ordena cronològicament.
 def prune_snapshots(vra, vm, prefix, keep, label=""):
     """Esborra els snapshots '<prefix>-AAAAMMDD-HHMMSS' més antics, deixant-ne `keep`."""
@@ -343,7 +378,7 @@ def read_vms_file(path):
 
 def confirm_destructive(cmd, vms):
     """Demana confirmació (només en interactiu) abans d'una acció destructiva sobre diverses VM."""
-    names = ", ".join(v.get("name", v["id"]) for v in vms)
+    names = ", ".join(vm_label(v) for v in vms)
     if not sys.stdin.isatty():
         sys.exit(f"'{cmd}' sobre {len(vms)} VMs requereix --yes (no hi ha terminal per confirmar-ho).")
     print(f"S'executarà '{cmd}' sobre {len(vms)} VMs: {names}")
@@ -444,10 +479,13 @@ def run():
         say(f"OK: autenticat a {host}; el vostre compte veu {n} VMs.")
         return
     if a.cmd == "list":
-        for v in sorted(vra.machines(), key=lambda v: v.get("name", "")):
-            if a.match and not any(fnmatch.fnmatchcase(v.get("name", ""), p) for p in a.match):
-                continue
-            say(f"{v['id']}  {v.get('name', '-'):<32} {v.get('powerState', '?'):<9} {v.get('address', '')}")
+        rows = [v for v in sorted(vra.machines(), key=lambda v: v["deploymentName"])
+                if not a.match or any(match_vm(v, p) for p in a.match)]
+        w = max([len("DEPLOYMENT")] + [len(v["deploymentName"]) for v in rows])
+        say(f"{'DEPLOYMENT':<{w}}  {'VM':<12} {'ESTAT':<9} {'ADREÇA':<15} ID")
+        for v in rows:
+            say(f"{v['deploymentName']:<{w}}  {v.get('name', '-'):<12} {v.get('powerState', '?'):<9} "
+                f"{v.get('address', ''):<15} {v['id']}")
         return
 
     vms = vra.find_all(a.vm + (read_vms_file(a.vms_file) if a.vms_file else []), a.match or ())
@@ -462,12 +500,12 @@ def run():
 
     def work(vm):
         """Fa l'operació sobre una VM. Retorna True si ha anat bé; els errors es reporten aquí."""
-        label = f"{vm.get('name')} ({vm['id']})"
-        prefix = f"[{vm.get('name')}] " if many else ""
+        label = vm_label(vm)
+        prefix = f"[{vm['deploymentName']}] " if many else ""
         base = f"/iaas/api/machines/{vm['id']}"
         try:
             if a.cmd == "status":
-                say(f"{vm.get('name')} ({vm['id']}): {vm.get('powerState', '?')}")
+                say(f"{label}: {vm.get('powerState', '?')}")
                 return True
             if a.cmd == "snapshots":
                 lines = [f"{'*' if s.get('isCurrent') else ' '} {s.get('name', ''):<32} "

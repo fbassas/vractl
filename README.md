@@ -114,8 +114,8 @@ com *"No es pot verificar el certificat del servidor"*. Solucions, per ordre de 
 ## Ús
 
 ```bash
-./vractl.py list                                   # totes les VMs que veieu
-./vractl.py status web01                           # estat d'una VM (per nom o id)
+./vractl.py list                                   # totes les VMs que veieu, per deployment
+./vractl.py status web01                           # estat d'una VM (pel nom del deployment)
 
 ./vractl.py start web01                            # arrencar
 ./vractl.py shutdown web01                         # aturada neta (cal VMware Tools)
@@ -133,7 +133,28 @@ com *"No es pot verificar el certificat del servidor"*. Solucions, per ordre de 
 ./vractl.py delsnap web01 pre-update               # esborrar
 ```
 
-La VM es pot indicar pel **nom** o per l'**id** (un UUID). Si un nom es repeteix, feu servir l'id.
+### Com s'identifiquen les VMs
+
+Aria Automation agrupa les VMs en **deployments**, el nom dels quals sol ser més descriptiu que el
+de la VM. Per això `vractl` identifica les VMs **pel nom del deployment**:
+
+```
+$ ./vractl.py list
+DEPLOYMENT   VM        ESTAT  ADREÇA        ID
+web-prod     vm-0012   ON     192.0.2.11    11111111-aaaa-bbbb-cccc-000000000001
+db-prod      vm-0013   ON     192.0.2.12    22222222-aaaa-bbbb-cccc-000000000002
+```
+
+Allà on s'espera una VM, es pot donar (per aquest ordre de preferència):
+
+1. el **nom del deployment** (`web-prod`). Si el deployment té diverses VMs, se seleccionen **totes**;
+2. el **nom de la VM** (`vm-0012`);
+3. l'**id** de la VM (un UUID).
+
+Si un nom pot referir-se a dues coses diferents (p. ex. el nom d'un deployment i el nom d'una altra
+VM, o dues VMs amb el mateix nom), el script ho diu i no fa res: feu servir l'id (l'última columna
+de `list`). Els missatges mostren el deployment i, si és diferent, el nom de la VM entre parèntesis
+(`web-prod (vm-0012)`). Si no es poden llegir els deployments, s'usen els noms de VM i s'avisa.
 Per defecte el script espera que l'operació acabi (seguiment del *request tracker*) i falla si
 Aria Automation la marca com a `FAILED`. Amb `--no-wait` retorna l'id del tracker immediatament
 (l'opció va **abans** del subcomandament).
@@ -163,7 +184,7 @@ amb `--parallel N`, fins a N alhora (opcions **abans** del subcomandament):
 ### Seleccionar VMs per patró o per fitxer (`--match`, `--vms-file`)
 
 ```bash
-./vractl.py --match 'web-*' status                       # patró sobre el nom, entre cometes
+./vractl.py --match 'www*' status                        # patró sobre el deployment, entre cometes
 ./vractl.py --match 'web-*' --parallel 4 --yes shutdown
 ./vractl.py --match 'web*' --match 'db*' start           # es pot repetir: unió dels patrons
 ./vractl.py --match 'web*' snapshot nocturn --keep 7     # amb --match, snapshot només necessita el NOM
@@ -171,8 +192,9 @@ amb `--parallel N`, fins a N alhora (opcions **abans** del subcomandament):
 ./vractl.py --match 'web*' list                          # a list, només filtra
 ```
 
-Els patrons són de tipus shell (`*`, `?`, `[abc]`), s'apliquen al **nom**, **distingeixen
-majúscules** i van ancorats a tot el nom (`web-*` no troba `old-web-1`; cal `*web*`). Un patró pot
+Els patrons són de tipus shell (`*`, `?`, `[abc]`) i coincideixen amb el **nom del deployment o el
+de la VM**; **distingeixen majúscules** i van ancorats a tot el nom (`web-*` no troba `old-web-1`;
+cal `*web*`). Un patró pot
 agafar més VMs de les previstes: abans de fer-hi res destructiu, comproveu-ho amb `list` o `status`.
 Si un patró no coincideix amb cap VM, no es fa res.
 
