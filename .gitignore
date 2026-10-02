@@ -1,0 +1,26 @@
+# Entorn virtual de Python
+.venv/
+venv/
+
+# Cache de Python
+__pycache__/
+*.py[cod]
+
+# Secrets: mai s'han de pujar al repositori
+token
+*.token
+.vractl.env
+.env
+*.pem
+*.key
+*.cer
+*.crt
+
+# Editors i sistema
+.vscode/
+.idea/
+*.swp
+.DS_Store
+
+# Llistes de VMs locals (poden contenir noms interns)
+vms.txt

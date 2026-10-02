@@ -1,0 +1,2 @@
+# vractl només fa servir la biblioteca estàndard de Python 3 (>= 3.8).
+# No cal instal·lar cap paquet extern; aquest fitxer es manté per si se n'afegeixen en el futur.
