@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""vractl - gestiona VMs de VMware Aria Automation (vRA 8.x) amb la IaaS API.
+"""vractl - gestiona VMs de VMware Aria Automation (vRA 8.x) amb les accions de Day 2 de Service Broker.
 
 Arrencar, aturar, reiniciar i fer snapshots d'una o més VMs, en sèrie o en paral·lel.
 
@@ -9,6 +9,7 @@ Servidor i autenticació:
   VRA_TOKEN_FILE         (alternativa) fitxer que conté el token; si no es defineix cap de les
                          dues, es prova ~/.config/vractl/token. Hauria de tenir permisos 600.
   El token es canvia per un token d'accés (JWT) a cada execució: POST /iaas/api/login.
+  Les operacions fan servir la Deployment API (com la interfície web); les lectures, la IaaS API.
   'vractl.py login' obté un token nou amb usuari i contrasenya i el desa al fitxer.
 
 TLS:
@@ -57,12 +58,21 @@ from concurrent.futures import ThreadPoolExecutor
 
 DEFAULT_API_VERSION = "2021-07-15"
 DEFAULT_TOKEN_FILE = os.path.expanduser("~/.config/vractl/token")
-# subcomandament -> operació de la IaaS API (/iaas/api/machines/{id}/operations/<operació>)
-POWER_ACTIONS = {
-    "start": "power-on", "stop": "power-off", "shutdown": "shutdown",
-    "reboot": "reboot", "reset": "reset", "suspend": "suspend",
-    "resume": "power-on",  # Aria no té "resume": una VM suspesa es reprèn arrencant-la
+# Les operacions es fan amb la Deployment API (la de Service Broker): és la que permet les accions
+# de Day 2 amb el rol de consumidor. Les lectures (llistar VMs i snapshots) fan servir la IaaS API.
+ACTION_PREFIX = "Cloud.vSphere.Machine."
+POWER_ACTIONS = {  # subcomandament -> acció de Day 2
+    "start": "PowerOn", "stop": "PowerOff", "shutdown": "Shutdown",
+    "reboot": "Reboot", "reset": "Reset", "suspend": "Suspend",
+    "resume": "PowerOn",  # no hi ha "Resume": una VM suspesa es reprèn arrencant-la
 }
+ACTION_SNAP_CREATE = ACTION_PREFIX + "Snapshot.Create"
+ACTION_SNAP_DELETE = ACTION_PREFIX + "Snapshot.Delete"
+ACTION_SNAP_REVERT = ACTION_PREFIX + "Snapshot.Revert"
+# Estats finals d'una petició (Request.status) i els que esperen una persona
+REQ_FAILED = ("FAILED", "ABORTED", "APPROVAL_REJECTED")
+REQ_NEEDS_HUMAN = {"APPROVAL_PENDING": "aprovació", "USER_INTERACTION_PENDING": "una acció d'un usuari"}
+ACTION_RETRIES, ACTION_RETRY_DELAY = 5, 10  # reintents si Aria respon 409 (hi ha una altra operació en curs)
 # Accions que, sobre més d'una VM, exigeixen confirmació (o --yes)
 DESTRUCTIVE = ("stop", "reset", "rollback", "delsnap")
 # Subcomandaments amb la forma "VM [VM...] NOM": el nom és l'últim argument
@@ -184,7 +194,7 @@ class Vra:
     # --- HTTP ---------------------------------------------------------------------------------
 
     def _request(self, method, path, query=None, body=None, auth=True, _retry=True):
-        q = {} if path == "/iaas/api/login" or path.startswith("/csp/") else {"apiVersion": self.api_version}
+        q = {"apiVersion": self.api_version} if path.startswith("/iaas/api/") and path != "/iaas/api/login" else {}
         q.update(query or {})
         url = f"https://{self.host}{path}" + (f"?{urllib.parse.urlencode(q)}" if q else "")
         data = json.dumps(body).encode() if body is not None else None
@@ -325,28 +335,77 @@ class Vra:
                            f"{[s['id'] for s in hits]}); indiqueu-ne l'id")
         return hits[0]["id"]
 
-    def wait(self, tracker, timeout=900, interval=3):
-        """Espera que acabi una operació (request tracker). Retorna si FINISHED, llença si FAILED."""
-        tid = (tracker or {}).get("id")
-        if not tid:
+    def snapshot_dates(self, machine_id):
+        """{id del snapshot: data i hora reals (ISO) de vCenter}, llegides de l'acció 'Delete Snapshot'.
+
+        L'acció llista els snapshots amb la data real entre parèntesis al títol; la IaaS API només
+        dona la data en què Aria els va registrar. Si no es pot llegir, retorna {}.
+        """
+        try:
+            act = self._request("GET", f"/deployment/api/resources/{machine_id}/actions/{ACTION_SNAP_DELETE}")
+        except VraError:
+            return {}
+        schema = (act or {}).get("schema") or {}
+        prop = (schema.get("properties", schema) or {}).get("snapshotId") or {}
+        out = {}
+        for o in prop.get("oneOf", []):
+            m = re.search(r"\((\d{4}-\d{2}-\d{2}T[^)]*)\)\s*$", o.get("title") or "")
+            if m and o.get("const"):
+                out[o["const"].rsplit("/", 1)[-1]] = m.group(1)
+        return out
+
+    def snapshots_detailed(self, machine_id):
+        """Snapshots de la VM, cadascun amb 'realDate' (data real de vCenter) si es coneix."""
+        snaps = self.snapshots(machine_id)
+        if snaps:
+            dates = self.snapshot_dates(machine_id)
+            for sn in snaps:
+                sn["realDate"] = dates.get(sn.get("id"))
+        return snaps
+
+    def wait(self, request, timeout=900, interval=3):
+        """Espera que acabi una petició d'acció (Request). Llença si falla o necessita una persona."""
+        rid = (request or {}).get("id")
+        if not rid:
             return
         end = time.time() + timeout
         while True:
-            t = self._request("GET", f"/iaas/api/request-tracker/{tid}") or {}
-            if t.get("status") == "FINISHED":
+            r = self._request("GET", f"/deployment/api/requests/{rid}") or {}
+            st = r.get("status")
+            if st == "SUCCESSFUL":
                 return
-            if t.get("status") == "FAILED":
-                raise OpFailed(t.get("message") or "sense missatge")
+            if st in REQ_FAILED:
+                raise OpFailed(f"{st}: {r.get('details') or 'sense detalls'}")
+            if st in REQ_NEEDS_HUMAN:
+                raise VraError(f"la petició {rid} espera {REQ_NEEDS_HUMAN[st]} a Aria Automation ({st}); "
+                               "no s'espera més, però continua pendent allà")
             if time.time() > end:
-                raise VraError("temps d'espera esgotat (l'operació pot continuar a Aria Automation)")
+                raise VraError(f"temps d'espera esgotat (la petició {rid} pot continuar a Aria Automation)")
             time.sleep(interval)
 
-    def run(self, method, path, body=None, wait=True):
-        """Llança una operació (202 + tracker) i, si wait, n'espera el final. Retorna el tracker."""
-        tracker = self._request(method, path, body=body)
+    def action(self, resource_id, action_id, inputs=None, wait=True):
+        """Demana una acció de Day 2 sobre una VM i, si wait, n'espera el final. Retorna la petició.
+
+        Si Aria respon 409 (conflicte: probablement hi ha una altra operació en curs sobre la VM), la
+        petició no s'ha acceptat i es reintenta unes quantes vegades.
+        """
+        body = {"actionId": action_id, "inputs": inputs or {}, "reason": "vractl"}
+        for attempt in range(ACTION_RETRIES + 1):
+            try:
+                req = self._request("POST", f"/deployment/api/resources/{resource_id}/requests", body=body)
+                break
+            except ApiError as e:
+                if e.code == 409 and attempt < ACTION_RETRIES:
+                    say(f"Aria Automation té un conflicte amb una altra operació sobre la VM (HTTP 409); "
+                        f"reintent {attempt + 1}/{ACTION_RETRIES} d'aquí a {ACTION_RETRY_DELAY}s...", err=True)
+                    time.sleep(ACTION_RETRY_DELAY)
+                    continue
+                if e.code == 403:
+                    raise VraError("el vostre compte no té permís per fer aquesta acció sobre la VM (HTTP 403)") from e
+                raise
         if wait:
-            self.wait(tracker)
-        return tracker
+            self.wait(req)
+        return req
 
 
 def vm_label(vm):
@@ -366,7 +425,8 @@ def match_vm(vm, pattern):
 def describe_snapshot(snap):
     """'nom', del AAAA-MM-DD (descripció)"""
     desc = (snap.get("description") or "").strip()
-    return f"'{snap.get('name', '')}', del {(snap.get('createdAt') or '?')[:10]}" + (f" ({desc})" if desc else "")
+    date = (snap.get("realDate") or snap.get("createdAt") or "?")[:10]  # preferim la data real de vCenter
+    return f"'{snap.get('name', '')}', del {date}" + (f" ({desc})" if desc else "")
 
 
 def plan_snapshots(vra, vms, new_name, assume_yes):
@@ -379,7 +439,7 @@ def plan_snapshots(vra, vms, new_name, assume_yes):
     existing, failed = {}, set()
     for vm in vms:
         try:
-            snaps = vra.snapshots(vm["id"])
+            snaps = vra.snapshots_detailed(vm["id"])
         except VraError as e:
             say(f"ERROR: snapshot {vm_label(vm)}: no puc llegir els snapshots existents: {e}", err=True)
             failed.add(vm["id"])
@@ -464,7 +524,7 @@ def run():
                          "es pot repetir; citeu-lo perquè la shell no l'expandeixi)")
     ap.add_argument("--vms-file", metavar="FITXER",
                     help="fitxer amb una VM (nom o id) per línia (# = comentari)")
-    ap.add_argument("--no-wait", action="store_true", help="no esperis que acabi l'operació")
+    ap.add_argument("--no-wait", action="store_true", help="no esperis que acabi la petició")
     ap.add_argument("--parallel", type=int, default=1, metavar="N",
                     help="nombre de VMs a tractar alhora (defecte: 1, una darrere l'altra)")
     ap.add_argument("--yes", action="store_true",
@@ -486,7 +546,8 @@ def run():
                             "amb --match o --vms-file només cal el nom")
     p = subs["snapshot"]
     p.add_argument("--desc", default="")
-    p.add_argument("--memory", action="store_true", help="inclou la memòria (snapshot amb la VM encesa)")
+    p.add_argument("--memory", action="store_true",
+                   help="inclou la memòria (per defecte NO, a diferència de la interfície web: triga més i pot parar la VM)")
     a = ap.parse_args()
 
     selectors = bool(a.match or a.vms_file)  # VMs triades per patró o fitxer, no a la línia d'ordres
@@ -538,7 +599,6 @@ def run():
         """Fa l'operació sobre una VM. True = bé, False = error (ja informat), None = omesa."""
         label = vm_label(vm)
         prefix = f"[{vm['deploymentName']}] " if many else ""
-        base = f"/iaas/api/machines/{vm['id']}"
         if vm["id"] in plan_failed:  # ja s'ha informat de l'error
             return False
         if vm["id"] in skipped:
@@ -550,44 +610,46 @@ def run():
                 return True
             if a.cmd == "snapshots":
                 lines = [f"{'*' if s.get('isCurrent') else ' '} {s.get('name', ''):<32} "
-                         f"{s.get('createdAt', '')[:19]:<10}  {s.get('id', ''):<36}  {s.get('description', '')}"
-                         for s in vra.snapshots(vm["id"])]
+                         f"{(s.get('realDate') or s.get('createdAt') or '')[:10]:<10}  {s.get('id', ''):<36}  "
+                         f"{s.get('description', '')}"
+                         for s in vra.snapshots_detailed(vm["id"])]
                 if many:
                     lines.insert(0, f"== {label}")
                 if lines:
                     say("\n".join(lines))
                 return True
 
-            body = None
+            inputs = None
             if a.cmd in POWER_ACTIONS:
-                method, path = "POST", f"{base}/operations/{POWER_ACTIONS[a.cmd]}"
+                action_id = ACTION_PREFIX + POWER_ACTIONS[a.cmd]
             elif a.cmd == "snapshot":
-                method, path = "POST", f"{base}/operations/snapshots"
-                body = {"name": snapname, "description": a.desc, "snapshotMemory": a.memory}
+                action_id = ACTION_SNAP_CREATE
+                # la interfície web fa snapshot amb memòria per defecte; aquí només amb --memory
+                inputs = {"name": snapname, "description": a.desc, "memorySnapshot": a.memory}
             elif a.cmd == "rollback":
-                method, path = "POST", f"{base}/operations/revert/{vra.snapshot_id(vm, a.name)}"
+                action_id, inputs = ACTION_SNAP_REVERT, {"snapshotId": f"/resources/snapshots/{vra.snapshot_id(vm, a.name)}"}
             elif a.cmd == "delsnap":
-                method, path = "DELETE", f"{base}/snapshots/{vra.snapshot_id(vm, a.name)}"
+                action_id, inputs = ACTION_SNAP_DELETE, {"snapshotId": f"/resources/snapshots/{vra.snapshot_id(vm, a.name)}"}
 
             deleted = []
             if a.cmd == "snapshot":  # primer s'esborra l'existent (sempre s'espera) i després es crea el nou
                 for old in to_replace.get(vm["id"], []):
                     try:
-                        vra.run("DELETE", f"{base}/snapshots/{old['id']}")
+                        vra.action(vm["id"], ACTION_SNAP_DELETE, {"snapshotId": f"/resources/snapshots/{old['id']}"})
                     except VraError as e:
                         raise VraError(f"no s'ha pogut esborrar el snapshot existent ({describe_snapshot(old)}): "
                                        f"{e}. No s'ha creat el nou.") from e
                     deleted.append(old)
                     say(f"{prefix}Esborrat el snapshot existent: {describe_snapshot(old)}")
             try:
-                tracker = vra.run(method, path, body, wait=not a.no_wait)
+                req = vra.action(vm["id"], action_id, inputs, wait=not a.no_wait)
             except VraError as e:
                 if deleted:
                     raise VraError(f"{e}. ATENCIÓ: el snapshot anterior ({describe_snapshot(deleted[0])}) ja "
                                    "s'havia esborrat i ara la VM no en té cap.") from e
                 raise
             if a.no_wait:
-                say(f"Operació enviada: {a.cmd} {label}: {(tracker or {}).get('id', '-')}")
+                say(f"Petició enviada: {a.cmd} {label}: {(req or {}).get('id', '-')}")
             else:
                 say(f"OK: {a.cmd} {label}")
             return True

@@ -1,14 +1,19 @@
 # vractl
 
 Eina de línia d'ordres per gestionar màquines virtuals de **VMware Aria Automation 8.x** (abans
-vRealize Automation) amb la seva **IaaS API**: arrencar, aturar, reiniciar i fer snapshots d'una o
-més VMs, en sèrie o en paral·lel. Fa servir les mateixes opcions que
-[pvectl](https://github.com/fbassas/pvectl) (la versió per a Proxmox).
+vRealize Automation): arrencar, aturar, reiniciar i fer snapshots d'una o més VMs, en sèrie o en
+paral·lel. Fa servir les mateixes opcions que [pvectl](https://github.com/fbassas/pvectl) (la
+versió per a Proxmox).
 
-> **Estat:** el script s'ha provat amb un servidor Aria Automation **simulat** (HTTPS, login,
-> paginació, renovació del token, seguiment d'operacions), construït a partir del Swagger de la
-> IaaS API. **Encara no s'ha provat contra una instància real.** Comenceu per `check` i `list`
-> (només lectura) i feu les primeres operacions amb una VM de prova.
+**Com parla amb Aria Automation.** Les *operacions* fan servir la **Deployment API** (la de
+*Service Broker*): són les mateixes accions de Day 2 que la interfície web ofereix a cada VM
+(*Power On*, *Create Snapshot*...) i no cal ser administrador de Cloud Assembly, només tenir permís
+per fer-les a la web. Les *lectures* (llistar VMs i snapshots) fan servir la IaaS API.
+
+> **Estat:** les operacions s'han provat amb un servidor Aria Automation **simulat** (HTTPS, login,
+> peticions d'acció, seguiment, reintents), i **contra una instància real només en lectura**
+> (`check`, `list`, `status`, `snapshots`, i la comprovació que les accions existeixen a cada VM).
+> **Encara no s'ha fet cap acció real.** Feu les primeres amb una VM de prova.
 
 Operacions: arrencar, aturar (dur o net), reiniciar, reset, suspendre/reprendre, crear/llistar/
 revertir/esborrar snapshots i consultar l'estat.
@@ -17,7 +22,7 @@ revertir/esborrar snapshots i consultar l'estat.
 
 - Python 3.8 o superior (no cal cap paquet extern).
 - Accés HTTPS (443) al servidor d'Aria Automation.
-- Un compte amb permís per gestionar les VMs a la IaaS API (vegeu *Permisos*).
+- Un compte amb permís per fer accions de Day 2 a les VMs des de la interfície web (vegeu *Permisos*).
 
 ## Instal·lació
 
@@ -126,7 +131,7 @@ com *"No es pot verificar el certificat del servidor"*. Solucions, per ordre de 
 ./vractl.py resume web01                           # = arrencar una VM suspesa
 
 ./vractl.py snapshot web01 pre-update --desc "abans d'actualitzar"
-./vractl.py snapshot web01 amb-ram --memory        # inclou la memòria
+./vractl.py snapshot web01 amb-ram --memory        # inclou la memòria (per defecte NO)
 ./vractl.py snapshots web01                        # llistar, amb id (* = snapshot actual)
 ./vractl.py rollback web01 pre-update              # revertir
 ./vractl.py delsnap web01 pre-update               # esborrar
@@ -154,9 +159,12 @@ Si un nom pot referir-se a dues coses diferents (p. ex. el nom d'un deployment i
 VM, o dues VMs amb el mateix nom), el script ho diu i no fa res: feu servir l'id (l'última columna
 de `list`). Els missatges mostren el deployment i, si és diferent, el nom de la VM entre parèntesis
 (`web-prod (vm-0012)`). Si no es poden llegir els deployments, s'usen els noms de VM i s'avisa.
-Per defecte el script espera que l'operació acabi (seguiment del *request tracker*) i falla si
-Aria Automation la marca com a `FAILED`. Amb `--no-wait` retorna l'id del tracker immediatament
-(l'opció va **abans** del subcomandament).
+Cada operació és una **petició** (*request*) a Aria Automation. Per defecte el script espera que
+acabi i falla si l'estat és `FAILED`, `ABORTED` o `APPROVAL_REJECTED` (mostrant-ne els detalls). Si la
+petició queda esperant una **aprovació** o una acció d'un usuari, no s'espera indefinidament: ho diu
+i la petició continua pendent a Aria. Si Aria respon `409` (conflicte, normalment perquè hi ha una
+altra operació en curs sobre la VM), es reintenta fins a 5 vegades cada 10 s. Amb `--no-wait`
+retorna l'id de la petició immediatament (l'opció va **abans** del subcomandament).
 
 ### Diverses VMs (`--parallel`)
 
@@ -243,9 +251,16 @@ mostra a la tercera columna:
 
 ## Permisos i notes
 
-- La IaaS API (`/iaas/api/machines…`) requereix permisos de **Cloud Assembly** sobre el projecte.
-  Amb un rol només de *Service Broker* és possible que rebeu `403`; en aquest cas caldria la
-  *Deployment API*, que aquest script no fa servir.
+- Les operacions són les accions de Day 2 de *Service Broker*, així que necessiteu el mateix permís
+  que a la web: amb un rol de consumidor n'hi ha prou. (La **IaaS API** directa exigeix rols de
+  Cloud Assembly: amb només Service Broker permet llegir però respon `403` a qualsevol acció, per
+  això `vractl` no la fa servir per operar.) Si una acció us dona `403`, el vostre compte no la pot
+  fer sobre aquella VM.
+- **Memòria als snapshots:** la interfície web crea els snapshots **amb memòria** per defecte;
+  `vractl` **no**, tret que indiqueu `--memory`. Un snapshot amb memòria d'una VM encesa triga més i
+  pot aturar-la breument.
+- **Data dels snapshots:** s'usa la data **real** de vCenter, no la de registre a Aria (que pot ser
+  molt posterior si la VM es va incorporar després).
 - Només veieu les VMs dels vostres projectes. Les polítiques de governança poden restringir
   accions concretes.
 - Les operacions de Day 2 les fa Aria Automation sobre vCenter; poden tardar. El temps màxim
