@@ -27,12 +27,24 @@ revertir/esborrar snapshots i consultar l'estat.
 
 ## Instal·lació
 
+**Opció A: com a paquet (recomanat).** Instal·la l'ordre `vractl` a tot el sistema (només cal
+Python 3.8+; no hi ha cap dependència externa):
+
+```bash
+pip install .
+# o bé, instal·lat des de PyPI:  pip install vractl
+vractl --version        # -> vractl 1.0.0
+```
+
+**Opció B: sense instal·lar.** Executa el script directament des del repositori:
+
 ```bash
 cd ~/vractl
-python3 -m venv .venv
-source .venv/bin/activate
-pip install -r requirements.txt  # no instal·la res, però és inofensiu
+./vractl.py --help
 ```
+
+En els exemples següents es fa servir `vractl` (la versió instal·lada); si executeu el script
+directament, substituïu-lo per `./vractl.py`.
 
 ## Configuració
 
@@ -198,6 +210,24 @@ genereu `~/.config/vractl/ca.pem` en una on funcioni i copieu-lo.
 ./vractl.py delsnap web01 pre-update               # esborrar
 ```
 
+### Sortida en JSON (`--json`)
+
+Els subcomandaments de lectura (`list`, `status`, `snapshots`, `check`) accepten `--json` per
+producir sortida apta per a scripts (una línia de diagnòstic continua anant a l'stderr; l'stdout
+només porta el JSON):
+
+```bash
+vractl --json list                     # llista de {deployment, vm, powerState, address, id}
+vractl --json status web01 web02       # per VM: {deployment, vm, powerState}
+vractl --json snapshots web01          # per VM: {deployment, vm, snapshots:[...]}
+vractl --json check                    # {ok, host, vms}
+
+vractl --json list | jq -r '.[] | select(.powerState=="OFF") | .deployment'
+```
+
+Els camps són estables (nom d'objecte i claus); afegir-ne de nous en el futur no trencarà els
+scripts existents.
+
 ### Com s'identifiquen les VMs
 
 Aria Automation agrupa les VMs en **deployments**, el nom dels quals sol ser més descriptiu que el
@@ -329,6 +359,16 @@ mostra a la tercera columna:
   d'espera per operació és de 15 minuts.
 - Un `401` durant l'execució (token d'accés caducat) es resol sol amb un nou login. Un token d'API
   caducat o invàlid dona un error que indica com generar-ne un de nou.
+
+## Desenvolupament i proves
+
+No hi ha cap dependència externa: l'suite de proves és 100 % offline (simula el servidor via el
+transport HTTP injectable, `Vra._http`), així que no cal cap Aria Automation per executar-lo:
+
+```bash
+pip install -e ".[dev]"
+pytest -q        # 43 proves, totes sense xarxa
+```
 
 ## Llicència
 

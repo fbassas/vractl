@@ -27,3 +27,9 @@ vms.txt
 
 # Certificats de CA locals (intermedis descarregats)
 ca/
+
+# Paquets construïts
+*.whl
+build/
+dist/
+*.egg-info/
