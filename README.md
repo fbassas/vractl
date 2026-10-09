@@ -12,9 +12,9 @@ per fer-les a la web. Les *lectures* (llistar VMs i snapshots) fan servir la Iaa
 
 > **Estat:** s'ha provat amb un servidor Aria Automation **simulat** (HTTPS, login, peticions
 > d'acció, seguiment, reintents) i **contra una instància real**: lectura (`check`, `list`, `status`,
-> `snapshots`) i el flux complet de `snapshot` (llegir el snapshot existent, esborrar-lo i crear el
-> nou) en una VM encesa. **Encara no s'han provat en real** `shutdown`, `stop`, `reboot`, `reset`,
-> `suspend`, `rollback`, `delsnap`, `--parallel` ni `--no-wait`. Feu les primeres amb una VM de prova.
+> `snapshots`), `snapshot` (amb un snapshot existent, que s'esborra abans de crear el nou, i sense
+> cap) i `delsnap`. **Encara no s'han provat en real** `shutdown`, `stop`, `reboot`, `reset`,
+> `suspend`, `rollback`, `--parallel` ni `--no-wait`. Feu les primeres amb una VM de prova.
 
 Operacions: arrencar, aturar (dur o net), reiniciar, reset, suspendre/reprendre, crear/llistar/
 revertir/esborrar snapshots i consultar l'estat.
