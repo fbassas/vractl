@@ -101,6 +101,12 @@ class ApiError(VraError):
             msg = json.loads(body).get("message") or body
         except (ValueError, AttributeError):
             pass
+        # Aria Automation respon en JSON: una pàgina HTML és d'un tallafoc, un proxy o un balancejador
+        self.html = isinstance(msg, str) and bool(re.search(r"<\s*(html|head|body|title|center)\b", msg, re.I))
+        if self.html:
+            t = re.search(r"<title[^>]*>(.*?)</title>", msg, re.I | re.S)
+            title = re.sub(r"\s+", " ", t.group(1)).strip() if t else ""
+            msg = "resposta HTML" + (f" («{title}»)" if title else "") + ", que no és d'Aria Automation"
         super().__init__(f"HTTP {code}: {str(msg).strip()[:300]}")
         self.code = code
 
@@ -113,6 +119,15 @@ class OpFailed(VraError):
 
 
 _print_lock = threading.Lock()
+
+
+BLOCKED_HINT = (
+    "La petició no ha arribat a Aria Automation: l'ha aturada un tallafoc o un servidor intermedi (no és un "
+    "problema de credencials). Probablement la xarxa des d'on l'executeu no té permís per accedir a aquest "
+    "servei. Compareu amb una màquina on funcioni (p.ex. 'curl -sS -o /dev/null -w \"%{http_code}\\n\" "
+    "https://SERVIDOR/iaas/api/about') o genereu el token en una màquina que sí que hi accedeixi i copieu-lo "
+    "a ~/.config/vractl/token (permisos 600)."
+)
 
 
 def say(msg, err=False):
@@ -255,6 +270,8 @@ class Vra:
         try:
             r = self._request("POST", "/iaas/api/login", body={"refreshToken": self.refresh_token}, auth=False)
         except ApiError as e:
+            if e.html:
+                raise VraError(f"{e}. {BLOCKED_HINT}")
             if e.code in (400, 401, 403):
                 raise VraError(f"El servidor ha rebutjat el token d'API ({e}). Pot haver caducat "
                                "(90 dies) o ser invàlid: genereu-ne un de nou amb 'vractl.py login'.")
@@ -269,6 +286,8 @@ class Vra:
             r = self._request("POST", "/csp/gateway/am/api/login", query={"access_token": ""},
                               body={"username": username, "password": password}, auth=False)
         except ApiError as e:
+            if e.html:
+                raise VraError(f"Login rebutjat ({e}). {BLOCKED_HINT}")
             if e.code in (400, 401, 403):
                 raise VraError(f"Login rebutjat ({e}). Comproveu usuari i contrasenya; si entreu "
                                "per SSO, genereu l'API token a la interfície web.")
