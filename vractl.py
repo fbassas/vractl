@@ -130,6 +130,9 @@ BLOCKED_HINT = (
 )
 
 
+__version__ = "1.0.0"
+
+
 def say(msg, err=False):
     """Imprimeix una línia sencera sense que es barregi amb la d'un altre fil."""
     with _print_lock:
@@ -223,6 +226,26 @@ class Vra:
 
     # --- HTTP ---------------------------------------------------------------------------------
 
+    def _http(self, method, url, headers, data):
+        """Round-trip HTTP baix nivell. Retorna els bytes de la resposta.
+
+        Aïllat del muntatge d'URL i de l'autenticació (que viuen a `_request`) perquè les proves
+        puguin simular la xarxa: una subclasse només sobreescriu aquest mètode. Aquí es tradueixen
+        les excepcions de xarxa a `ApiError` / `VraError`.
+        """
+        req = urllib.request.Request(url, data=data, method=method, headers=headers)
+        try:
+            with urllib.request.urlopen(req, context=self.ctx, timeout=30) as r:
+                return r.read()
+        except urllib.error.HTTPError as e:
+            raise ApiError(e.code, e.read().decode(errors="replace"))
+        except urllib.error.URLError as e:
+            if isinstance(e.reason, ssl.SSLCertVerificationError):
+                raise VraError(CERT_HINT + f" ({e.reason.verify_message})")
+            raise VraError(f"No puc connectar amb {self.host}: {e.reason}")
+        except OSError as e:
+            raise VraError(f"No puc connectar amb {self.host}: {e}")
+
     def _request(self, method, path, query=None, body=None, auth=True, _retry=True):
         q = {"apiVersion": self.api_version} if path.startswith("/iaas/api/") and path != "/iaas/api/login" else {}
         q.update(query or {})
@@ -235,21 +258,13 @@ class Vra:
         if auth:
             used = self._token()
             headers["Authorization"] = f"Bearer {used}"
-        req = urllib.request.Request(url, data=data, method=method, headers=headers)
         try:
-            with urllib.request.urlopen(req, context=self.ctx, timeout=30) as r:
-                raw = r.read()
-        except urllib.error.HTTPError as e:
+            raw = self._http(method, url, headers, data)
+        except ApiError as e:
             if e.code == 401 and auth and _retry:  # token d'accés caducat: un sol relogin
                 self._relogin(used)
                 return self._request(method, path, query, body, auth, _retry=False)
-            raise ApiError(e.code, e.read().decode(errors="replace"))
-        except urllib.error.URLError as e:
-            if isinstance(e.reason, ssl.SSLCertVerificationError):
-                raise VraError(CERT_HINT + f" ({e.reason.verify_message})")
-            raise VraError(f"No puc connectar amb {self.host}: {e.reason}")
-        except OSError as e:
-            raise VraError(f"No puc connectar amb {self.host}: {e}")
+            raise
         return json.loads(raw) if raw.strip() else None
 
     def _token(self):
@@ -717,6 +732,8 @@ def run():
     # add_help=False: el -h queda lliure per al servidor (l'ajuda és --help)
     ap = argparse.ArgumentParser(description="Gestió de VMs d'Aria Automation", add_help=False)
     ap.add_argument("--help", action="help", help="mostra aquesta ajuda i surt")
+    ap.add_argument("--version", action="version", version=f"vractl {__version__}",
+                    help="mostra la versió i surt")
     ap.add_argument("-h", "--host", metavar="HOST", help="servidor d'Aria Automation (o VRA_HOST)")
     ap.add_argument("--ca-file", metavar="FITXER",
                     help="certificats PEM addicionals de confiança, p.ex. un intermedi que falta (o VRA_CA_FILE)")
@@ -733,6 +750,8 @@ def run():
     ap.add_argument("--yes", action="store_true",
                     help="no demanis confirmació: ni per a accions destructives sobre diverses VMs, ni "
                          "per esborrar el snapshot existent abans de crear-ne un de nou")
+    ap.add_argument("--json", action="store_true",
+                    help="sortida en JSON (per a 'list', 'status', 'snapshots' i 'check')")
     sub = ap.add_subparsers(dest="cmd", required=True)
     sub.add_parser("login", help="obté un token d'API amb usuari i contrasenya i el desa")
     sub.add_parser("check", help="comprova el token i la connexió (només lectura)")
@@ -767,6 +786,9 @@ def run():
 
     if a.parallel < 1:
         sys.exit("--parallel ha de ser 1 o més.")
+    READ_ONLY = ("list", "status", "snapshots", "check")
+    if a.json and a.cmd not in READ_ONLY:
+        sys.exit("--json només funciona amb 'list', 'status', 'snapshots' o 'check' (subcomandaments de lectura).")
     host = normalize_host(a.host)
     if a.cmd == "fetch-ca":
         return cmd_fetch_ca(host, a.out)
@@ -781,11 +803,20 @@ def run():
     if a.cmd == "check":
         vra._token()
         n = len(vra.machines())
-        say(f"OK: autenticat a {host}; el vostre compte veu {n} VMs.")
+        if a.json:
+            say(json.dumps({"ok": True, "host": host, "vms": n}, ensure_ascii=False))
+        else:
+            say(f"OK: autenticat a {host}; el vostre compte veu {n} VMs.")
         return
     if a.cmd == "list":
         rows = [v for v in sorted(vra.machines(), key=lambda v: v["deploymentName"])
                 if not a.match or any(match_vm(v, p) for p in a.match)]
+        if a.json:
+            say(json.dumps([
+                {"deployment": v["deploymentName"], "vm": v.get("name"),
+                 "powerState": v.get("powerState"), "address": v.get("address"), "id": v["id"]}
+                for v in rows], ensure_ascii=False, indent=2))
+            return
         w = max([len("DEPLOYMENT")] + [len(v["deploymentName"]) for v in rows])
         say(f"{'DEPLOYMENT':<{w}}  {'VM':<12} {'ESTAT':<9} {'ADREÇA':<15} ID")
         for v in rows:
@@ -803,6 +834,8 @@ def run():
     if a.cmd == "snapshot":
         to_replace, skipped, plan_failed = plan_snapshots(vra, vms, snapname, a.yes)
 
+    json_rows = []  # per --json: es recullen els resultats i s'imprimeixen al final
+
     def work(vm):
         """Fa l'operació sobre una VM. True = bé, False = error (ja informat), None = omesa."""
         label = vm_label(vm)
@@ -810,17 +843,33 @@ def run():
         if vm["id"] in plan_failed:  # ja s'ha informat de l'error
             return False
         if vm["id"] in skipped:
-            say(f"{prefix}Omès: snapshot {label} (no s'ha confirmat esborrar el snapshot existent)")
+            if not a.json:
+                say(f"{prefix}Omès: snapshot {label} (no s'ha confirmat esborrar el snapshot existent)")
             return None
         try:
             if a.cmd == "status":
-                say(f"{label}: {vm.get('powerState', '?')}")
+                st = vm.get('powerState', '?')
+                if a.json:
+                    json_rows.append({"deployment": vm["deploymentName"], "vm": vm.get("name"),
+                                      "powerState": st})
+                else:
+                    say(f"{label}: {st}")
                 return True
             if a.cmd == "snapshots":
+                snaps = vra.snapshots_detailed(vm["id"])
+                if a.json:
+                    json_rows.append({
+                        "deployment": vm["deploymentName"], "vm": vm.get("name"),
+                        "snapshots": [
+                            {"name": s.get("name"), "id": s.get("id"),
+                             "date": (s.get("realDate") or s.get("createdAt") or "")[:10],
+                             "current": bool(s.get("isCurrent")), "description": s.get("description", "")}
+                            for s in snaps]})
+                    return True
                 lines = [f"{'*' if s.get('isCurrent') else ' '} {s.get('name', ''):<32} "
                          f"{(s.get('realDate') or s.get('createdAt') or '')[:10]:<10}  {s.get('id', ''):<36}  "
                          f"{s.get('description', '')}"
-                         for s in vra.snapshots_detailed(vm["id"])]
+                         for s in snaps]
                 if many:
                     lines.insert(0, f"== {label}")
                 if lines:
@@ -870,6 +919,12 @@ def run():
     else:
         with ThreadPoolExecutor(max_workers=min(a.parallel, len(vms))) as ex:
             results = list(ex.map(work, vms))
+
+    if a.json:
+        say(json.dumps(json_rows, ensure_ascii=False, indent=2))
+        if results.count(False):
+            sys.exit(1)
+        return
 
     failed, omitted = results.count(False), results.count(None)
     if many and (failed or omitted or a.cmd not in ("status", "snapshots")):  # a les consultes només si hi ha errors
