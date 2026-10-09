@@ -24,14 +24,18 @@ l'altra; amb --parallel N, fins a N alhora. També es poden seleccionar per patr
 coincideix amb el deployment o la VM; es pot repetir) o per fitxer (--vms-file, una VM per línia).
 Tot es pot combinar; van abans del subcomandament.
 
+Snapshots: la política de la plataforma és com a màxim 1 snapshot per VM. 'snapshot' mira si la VM
+ja en té: si no, el crea; si sí, en mostra el nom i la data i demana confirmació per esborrar-lo (amb
+--yes no pregunta) i, un cop esborrat, crea el nou.
+
 Exemples:
   vractl.py -h vra.example.org login
   vractl.py -h vra.example.org list
   vractl.py start web01
   vractl.py --parallel 4 start web01 web02 web03 web04
   vractl.py snapshot web01 pre-update --desc "abans d'actualitzar" [--memory]
-  vractl.py --parallel 3 snapshot web01 web02 web03 nocturn --keep 2   # el NOM és l'últim argument
-  vractl.py --match 'web*' snapshot nocturn --keep 7
+  vractl.py --parallel 3 snapshot web01 web02 web03 abans-update    # el NOM és l'últim argument
+  vractl.py --yes snapshot web01 abans-update   # si ja en té un, l'esborra sense preguntar
   vractl.py snapshots web01
   vractl.py rollback web01 pre-update
   vractl.py --yes delsnap web01 web02 pre-update
@@ -356,43 +360,56 @@ def match_vm(vm, pattern):
     return any(fnmatch.fnmatchcase(vm.get(k) or "", pattern) for k in ("deploymentName", "name"))
 
 
-# Amb --keep, el nom donat és un prefix i s'hi afegeix un sufix de data, que ordena cronològicament.
-def snapshot_limit(vm):
-    """Límit de snapshots de la VM (propietat 'snapshotLimit', un text), o None si no en té."""
-    try:
-        limit = int((vm.get("customProperties") or {}).get("snapshotLimit"))
-    except (TypeError, ValueError):
-        return None
-    return limit if limit > 0 else None
+# Política de la plataforma: com a màxim 1 snapshot per VM (per no penalitzar el rendiment).
+# Per això 'snapshot' no pot afegir-ne un de nou si ja n'hi ha un: cal esborrar l'existent
+# abans, i només amb confirmació de l'usuari.
+def describe_snapshot(snap):
+    """'nom', del AAAA-MM-DD (descripció)"""
+    desc = (snap.get("description") or "").strip()
+    return f"'{snap.get('name', '')}', del {(snap.get('createdAt') or '?')[:10]}" + (f" ({desc})" if desc else "")
 
 
-def keep_warnings(vm, n_existing, keep):
-    """Avisos sobre --keep per a una VM amb límit de snapshots (llista, buida si tot va bé).
+def plan_snapshots(vra, vms, new_name, assume_yes):
+    """Mira quines VMs ja tenen snapshot i, amb confirmació, decideix quins s'han d'esborrar.
 
-    --keep crea primer el snapshot nou i després esborra els antics, així que durant un instant la
-    VM en té un més que el final: amb el límit ja assolit, la creació falla.
+    S'executa al fil principal, abans de tocar res, perquè les preguntes no es barregin amb el
+    paral·lelisme. Retorna (a_esborrar, omeses, fallides): a_esborrar és {id de VM: [snapshots]},
+    omeses i fallides són conjunts d'ids de VM (omeses = l'usuari no ho ha confirmat).
     """
-    limit = snapshot_limit(vm)
-    if limit is None:
-        return []
-    out = []
-    if keep > limit:
-        out.append(f"--keep {keep} supera el límit de snapshots d'aquesta VM ({limit}): "
-                   f"com a molt se'n podran conservar {limit}.")
-    if n_existing >= limit:
-        out.append(f"la VM té {n_existing} snapshot(s) i el límit és {limit}: probablement la creació del "
-                   "nou fallarà, perquè --keep esborra els antics després de crear-lo.")
-    return out
-
-
-def prune_snapshots(vra, vm, prefix, keep, label=""):
-    """Esborra els snapshots '<prefix>-AAAAMMDD-HHMMSS' més antics, deixant-ne `keep`."""
-    pat = re.compile(re.escape(prefix) + r"-\d{8}-\d{6}$")
-    group = sorted((s for s in vra.snapshots(vm["id"]) if pat.match(s.get("name", ""))),
-                   key=lambda s: s["name"])
-    for old in group[:-keep]:
-        vra.run("DELETE", f"/iaas/api/machines/{vm['id']}/snapshots/{old['id']}")
-        say(f"{label}Esborrat snapshot antic: {old['name']}")
+    existing, failed = {}, set()
+    for vm in vms:
+        try:
+            snaps = vra.snapshots(vm["id"])
+        except VraError as e:
+            say(f"ERROR: snapshot {vm_label(vm)}: no puc llegir els snapshots existents: {e}", err=True)
+            failed.add(vm["id"])
+            continue
+        if snaps:
+            existing[vm["id"]] = snaps
+    if not existing:
+        return {}, set(), failed
+    by_id = {vm["id"]: vm for vm in vms}
+    if assume_yes:
+        return existing, set(), failed
+    if not sys.stdin.isatty():
+        lines = [f"  - {vm_label(by_id[i])}: " + "; ".join(describe_snapshot(s) for s in snaps)
+                 for i, snaps in existing.items()]
+        sys.exit("Aquestes VMs ja tenen snapshot (la política és com a màxim 1 per VM), i caldria esborrar-lo "
+                 "abans de crear-ne un de nou:\n" + "\n".join(lines) +
+                 "\nNo hi ha terminal per confirmar-ho: useu --yes per esborrar-los i continuar.")
+    to_delete, skipped = {}, set()
+    for i, snaps in existing.items():
+        n = len(snaps)
+        print(f"{vm_label(by_id[i])} ja té {n} snapshot{'s' if n > 1 else ''} (la política és com a màxim 1 per VM):")
+        for s in snaps:
+            print(f"  - {describe_snapshot(s)}")
+        q = (f"Esborrar-lo i crear-ne un de nou ('{new_name}')? [s/N] " if n == 1 else
+             f"Esborrar-los tots {n} i crear-ne un de nou ('{new_name}')? [s/N] ")
+        if input(q).strip().lower() in ("s", "si", "sí", "y", "yes"):
+            to_delete[i] = snaps
+        else:
+            skipped.add(i)
+    return to_delete, skipped, failed
 
 
 def read_vms_file(path):
@@ -451,7 +468,8 @@ def run():
     ap.add_argument("--parallel", type=int, default=1, metavar="N",
                     help="nombre de VMs a tractar alhora (defecte: 1, una darrere l'altra)")
     ap.add_argument("--yes", action="store_true",
-                    help="no demanis confirmació per a accions destructives sobre diverses VMs")
+                    help="no demanis confirmació: ni per a accions destructives sobre diverses VMs, ni "
+                         "per esborrar el snapshot existent abans de crear-ne un de nou")
     sub = ap.add_subparsers(dest="cmd", required=True)
     sub.add_parser("login", help="obté un token d'API amb usuari i contrasenya i el desa")
     sub.add_parser("check", help="comprova el token i la connexió (només lectura)")
@@ -469,9 +487,6 @@ def run():
     p = subs["snapshot"]
     p.add_argument("--desc", default="")
     p.add_argument("--memory", action="store_true", help="inclou la memòria (snapshot amb la VM encesa)")
-    p.add_argument("--keep", type=int, metavar="N",
-                   help="rotació: el nom és un prefix, s'hi afegeix la data (nom-AAAAMMDD-HHMMSS) "
-                        "i es conserven només els N snapshots més recents d'aquest prefix")
     a = ap.parse_args()
 
     selectors = bool(a.match or a.vms_file)  # VMs triades per patró o fitxer, no a la línia d'ordres
@@ -485,13 +500,6 @@ def run():
 
     if a.parallel < 1:
         sys.exit("--parallel ha de ser 1 o més.")
-    keep = getattr(a, "keep", None)
-    if keep is not None:
-        if keep < 1:
-            sys.exit("--keep ha de ser 1 o més.")
-        if a.no_wait:
-            sys.exit("--keep no es pot combinar amb --no-wait: cal esperar el snapshot per poder esborrar els antics.")
-
     host = normalize_host(a.host)
     vra = Vra(host, make_ssl_context(a.ca_file), a.api_version,
               refresh_token=None if a.cmd == "login" else load_token())
@@ -521,16 +529,21 @@ def run():
     if many and a.cmd in DESTRUCTIVE and not a.yes:
         confirm_destructive(a.cmd, vms)
 
-    # Un sol sufix per a tota l'execució: totes les VMs reben el mateix nom de snapshot
     snapname = getattr(a, "name", None)
-    if keep is not None:
-        snapname = f"{a.name}-{time.strftime('%Y%m%d-%H%M%S')}"
+    to_replace, skipped, plan_failed = {}, set(), set()
+    if a.cmd == "snapshot":
+        to_replace, skipped, plan_failed = plan_snapshots(vra, vms, snapname, a.yes)
 
     def work(vm):
-        """Fa l'operació sobre una VM. Retorna True si ha anat bé; els errors es reporten aquí."""
+        """Fa l'operació sobre una VM. True = bé, False = error (ja informat), None = omesa."""
         label = vm_label(vm)
         prefix = f"[{vm['deploymentName']}] " if many else ""
         base = f"/iaas/api/machines/{vm['id']}"
+        if vm["id"] in plan_failed:  # ja s'ha informat de l'error
+            return False
+        if vm["id"] in skipped:
+            say(f"{prefix}Omès: snapshot {label} (no s'ha confirmat esborrar el snapshot existent)")
+            return None
         try:
             if a.cmd == "status":
                 say(f"{label}: {vm.get('powerState', '?')}")
@@ -556,18 +569,27 @@ def run():
             elif a.cmd == "delsnap":
                 method, path = "DELETE", f"{base}/snapshots/{vra.snapshot_id(vm, a.name)}"
 
-            if a.cmd == "snapshot" and keep is not None and snapshot_limit(vm) is not None:
-                for w in keep_warnings(vm, len(vra.snapshots(vm["id"])), keep):
-                    say(f"{prefix}AVÍS {label}: {w}", err=True)
-
-            tracker = vra.run(method, path, body, wait=not a.no_wait)
+            deleted = []
+            if a.cmd == "snapshot":  # primer s'esborra l'existent (sempre s'espera) i després es crea el nou
+                for old in to_replace.get(vm["id"], []):
+                    try:
+                        vra.run("DELETE", f"{base}/snapshots/{old['id']}")
+                    except VraError as e:
+                        raise VraError(f"no s'ha pogut esborrar el snapshot existent ({describe_snapshot(old)}): "
+                                       f"{e}. No s'ha creat el nou.") from e
+                    deleted.append(old)
+                    say(f"{prefix}Esborrat el snapshot existent: {describe_snapshot(old)}")
+            try:
+                tracker = vra.run(method, path, body, wait=not a.no_wait)
+            except VraError as e:
+                if deleted:
+                    raise VraError(f"{e}. ATENCIÓ: el snapshot anterior ({describe_snapshot(deleted[0])}) ja "
+                                   "s'havia esborrat i ara la VM no en té cap.") from e
+                raise
             if a.no_wait:
                 say(f"Operació enviada: {a.cmd} {label}: {(tracker or {}).get('id', '-')}")
             else:
-                what = f"{a.cmd} '{snapname}'" if keep is not None else a.cmd
-                say(f"OK: {what} {label}")
-                if keep is not None:
-                    prune_snapshots(vra, vm, a.name, keep, prefix)
+                say(f"OK: {a.cmd} {label}")
             return True
         except VraError as e:
             say(f"ERROR: {a.cmd} {label}: {e}", err=True)
@@ -579,9 +601,10 @@ def run():
         with ThreadPoolExecutor(max_workers=min(a.parallel, len(vms))) as ex:
             results = list(ex.map(work, vms))
 
-    failed = results.count(False)
-    if many and (failed or a.cmd not in ("status", "snapshots")):  # a les consultes només si hi ha errors
-        say(f"Resum: {len(vms) - failed} correctes, {failed} amb error", err=bool(failed))
+    failed, omitted = results.count(False), results.count(None)
+    if many and (failed or omitted or a.cmd not in ("status", "snapshots")):  # a les consultes només si hi ha errors
+        say(f"Resum: {len(vms) - failed - omitted} correctes, "
+            + (f"{omitted} omeses, " if omitted else "") + f"{failed} amb error", err=bool(failed))
     if failed:
         sys.exit(1)
 

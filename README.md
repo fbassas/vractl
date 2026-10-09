@@ -127,7 +127,6 @@ com *"No es pot verificar el certificat del servidor"*. Solucions, per ordre de 
 
 ./vractl.py snapshot web01 pre-update --desc "abans d'actualitzar"
 ./vractl.py snapshot web01 amb-ram --memory        # inclou la memòria
-./vractl.py snapshot web01 nocturn --keep 2        # rotació: en conserva els 2 més recents
 ./vractl.py snapshots web01                        # llistar, amb id (* = snapshot actual)
 ./vractl.py rollback web01 pre-update              # revertir
 ./vractl.py delsnap web01 pre-update               # esborrar
@@ -172,13 +171,14 @@ amb `--parallel N`, fins a N alhora (opcions **abans** del subcomandament):
 ```
 
 - **Snapshot, rollback i delsnap** tenen la forma `VM [VM...] NOM`: l'**últim argument és el nom
-  del snapshot**. Les opcions del subcomandament (`--desc`, `--keep`...) van després.
+  del snapshot**. Les opcions del subcomandament (`--desc`, `--memory`) van després.
 - **Tot o res en la validació:** primer es resolen totes les VMs amb una sola consulta. Si alguna
   no existeix o el nom és ambigu, no es fa **res**.
 - **Un error no atura les altres:** cada VM es reporta per separat, al final surt un resum i el
   codi de sortida és **1** si alguna ha fallat (útil per a cron i scripts).
 - **Confirmació:** `stop`, `reset`, `rollback` i `delsnap` sobre **més d'una** VM demanen
-  confirmació; sense terminal (cron) cal `--yes`. Amb una sola VM no es demana mai.
+  confirmació; sense terminal (cron) cal `--yes`. Amb una sola VM no es demana mai. (El `snapshot`
+  té la seva pròpia confirmació, vegeu més avall.)
 - Amb `--parallel`, les línies surten en l'ordre en què cada VM acaba.
 
 ### Seleccionar VMs per patró o per fitxer (`--match`, `--vms-file`)
@@ -187,7 +187,7 @@ amb `--parallel N`, fins a N alhora (opcions **abans** del subcomandament):
 ./vractl.py --match 'www*' status                        # patró sobre el deployment, entre cometes
 ./vractl.py --match 'web-*' --parallel 4 --yes shutdown
 ./vractl.py --match 'web*' --match 'db*' start           # es pot repetir: unió dels patrons
-./vractl.py --match 'web*' snapshot nocturn --keep 7     # amb --match, snapshot només necessita el NOM
+./vractl.py --match 'web*' snapshot abans-update         # amb --match, snapshot només necessita el NOM
 ./vractl.py --vms-file vms.txt status                    # una VM (nom o id) per línia, # = comentari
 ./vractl.py --match 'web*' list                          # a list, només filtra
 ```
@@ -198,17 +198,39 @@ cal `*web*`). Un patró pot
 agafar més VMs de les previstes: abans de fer-hi res destructiu, comproveu-ho amb `list` o `status`.
 Si un patró no coincideix amb cap VM, no es fa res.
 
-### Rotació de snapshots (`--keep`)
+### Snapshots: com a màxim 1 per VM
 
-Amb `--keep N`, el nom del snapshot passa a ser un **prefix**: s'hi afegeix la data i l'hora
-(`nocturn-AAAAMMDD-HHMMSS`) i, un cop creat, s'esborren els més antics d'aquell prefix fins a
-conservar-ne N. Primer es crea el nou i **després** s'esborren els antics; només es toquen els
-snapshots que segueixen aquest patró. No es pot combinar amb `--no-wait`. Amb diverses VMs, totes
-reben el mateix nom i cada una es rota pel seu compte.
+La política de la plataforma és tenir **com a màxim 1 snapshot per VM** (per no penalitzar el
+rendiment); a les VMs creades des d'una plantilla, Aria Automation ho aplica amb la propietat
+`snapshotLimit` i rebutja un segon snapshot. Per això `snapshot` fa això, VM per VM:
 
-```bash
-./vractl.py snapshot web01 nocturn --keep 7        # per a cron: 0 2 * * * /ruta/vractl.py ...
+1. **Mira si la VM ja té algun snapshot.**
+2. Si **no en té cap**, el crea (no pregunta res).
+3. Si **en té**, en mostra el nom i la **data** i **demana confirmació** per esborrar-lo. Si
+   confirmeu, l'**esborra primer** i, un cop esborrat, **crea el nou**. Si no, aquesta VM s'omet.
+
 ```
+$ ./vractl.py snapshot web-prod abans-update
+web-prod (vm-0012) ja té 1 snapshot (la política és com a màxim 1 per VM):
+  - 'antic', del 2026-01-15 (descripció)
+Esborrar-lo i crear-ne un de nou ('abans-update')? [s/N] s
+Esborrat el snapshot existent: 'antic', del 2026-01-15 (descripció)
+OK: snapshot web-prod (vm-0012)
+```
+
+- El per defecte és **no** (Intro = no). Accepten `s`, `si`, `sí`, `y` i `yes`.
+- **`--yes`** respon que sí a tot: és el que cal en un cron o script, on no hi ha terminal. Sense
+  terminal i sense `--yes`, el script **es nega** a esborrar res i no fa **cap** canvi, ni a les VMs
+  que no tenien snapshot.
+- Amb **diverses VMs**, totes les preguntes es fan **abans** de començar i després s'actua (en
+  paral·lel si cal). Només es pregunta per les VMs que ja tenen snapshot. Les omeses surten al resum
+  i no compten com a error.
+- Si una VM en té **més d'un** (per exemple, VMs antigues), es mostren **tots** amb la seva data i
+  la pregunta és si els voleu esborrar tots; si confirmeu, s'esborren tots abans de crear el nou.
+- L'esborrat sempre s'espera a que acabi, encara que useu `--no-wait`.
+- **Compte:** com que primer s'esborra i després es crea, si la creació falla (per exemple, per
+  espai) **la VM es queda sense cap snapshot**. El script ho diu explícitament a l'error. Si
+  l'esborrat falla, no es crea el nou.
 
 Un snapshot també es pot indicar per **id** a `rollback` i `delsnap`. Cal si dos snapshots tenen el
 mateix nom, cosa que vSphere permet: el script ho detecta, no fa res i us demana l'id. `snapshots` el
@@ -218,19 +240,6 @@ mostra a la tercera columna:
 * abans-update              2026-01-15  33333333-aaaa-bbbb-cccc-000000000001  descripció
   abans-update              2026-01-08  44444444-aaaa-bbbb-cccc-000000000002  descripció
 ```
-
-**Límit de snapshots.** Algunes VMs porten la propietat `snapshotLimit` (p. ex. 1). Com que `--keep`
-crea primer el snapshot nou i **després** esborra els antics, en una VM que ja és al límit la creació
-probablement fallarà. Abans de crear-lo, `--keep` **avisa** (per stderr, sense aturar-se) si la VM
-ja és al límit o si el `--keep` demanat el supera:
-
-```
-AVÍS web-prod (vm-0012): la VM té 1 snapshot(s) i el límit és 1: probablement la creació del nou
-fallarà, perquè --keep esborra els antics després de crear-lo.
-```
-
-Només és un avís: no s'ha comprovat com aplica el límit el vostre Aria Automation. En aquests
-casos, esborreu el snapshot antic a mà (`delsnap`) abans de tornar a crear-ne un.
 
 ## Permisos i notes
 
