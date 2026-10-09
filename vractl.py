@@ -15,6 +15,8 @@ Servidor i autenticació:
 TLS:
   VRA_CA_FILE / --ca-file   certificats PEM addicionals (p.ex. l'intermedi que el servidor no envia);
                             s'afegeixen a les CA del sistema, no les substitueixen
+  'vractl.py -h HOST fetch-ca' baixa i verifica l'intermedi que falta i el desa a
+                            ~/.config/vractl/ca.pem, que es carrega sempre automàticament
   VRA_INSECURE=1            no verifica TLS (només proves; el token s'envia sense verificar el servidor)
 
 Identificació: les VMs s'indiquen pel nom del deployment (el més descriptiu; si en té diverses,
@@ -45,9 +47,11 @@ Exemples:
 import argparse
 import fnmatch
 import getpass
+import hashlib
 import json
 import os
 import re
+import socket
 import ssl
 import sys
 import threading
@@ -59,6 +63,9 @@ from concurrent.futures import ThreadPoolExecutor
 
 DEFAULT_API_VERSION = "2021-07-15"
 DEFAULT_TOKEN_FILE = os.path.expanduser("~/.config/vractl/token")
+# Certificats de CA addicionals (p.ex. intermedis que el servidor no envia), desats per 'fetch-ca';
+# si existeix, es carrega sempre, a més de les CA del sistema.
+DEFAULT_CA_FILE = os.path.expanduser("~/.config/vractl/ca.pem")
 # Les operacions es fan amb la Deployment API (la de Service Broker): és la que permet les accions
 # de Day 2 amb el rol de consumidor. Les lectures (llistar VMs i snapshots) fan servir la IaaS API.
 ACTION_PREFIX = "Cloud.vSphere.Machine."
@@ -173,13 +180,20 @@ def make_ssl_context(ca_file):
             ctx.load_verify_locations(cafile=os.path.expanduser(extra))
         except (OSError, ssl.SSLError) as e:
             sys.exit(f"No puc carregar el fitxer de CA ({extra}): {getattr(e, 'strerror', None) or e}")
+    if os.path.exists(DEFAULT_CA_FILE):  # el desat per 'fetch-ca'
+        try:
+            ctx.load_verify_locations(cafile=DEFAULT_CA_FILE)
+        except (OSError, ssl.SSLError) as e:
+            print(f"Avís: no puc carregar {DEFAULT_CA_FILE} ({getattr(e, 'strerror', None) or e}); s'ignora.",
+                  file=sys.stderr)
     return ctx
 
 
 CERT_HINT = (
     "No es pot verificar el certificat del servidor. Si el servidor no envia el certificat "
     "intermedi (el navegador el resol sol, però aquest script no), cal que els administradors "
-    "serveixin la cadena completa, o indicar-la amb --ca-file / VRA_CA_FILE."
+    "serveixin la cadena completa, o baixar-lo i verificar-lo amb 'vractl.py -h SERVIDOR fetch-ca' "
+    "(o indicar-lo amb --ca-file / VRA_CA_FILE)."
 )
 
 
@@ -492,6 +506,175 @@ def confirm_destructive(cmd, vms):
         sys.exit("Cancel·lat.")
 
 
+PEM_RE = re.compile(r"-----BEGIN CERTIFICATE-----.*?-----END CERTIFICATE-----", re.S)
+
+
+def der_aia_urls(der):
+    """URLs 'CA Issuers' (d'on baixar el certificat de l'emissor) d'un certificat en DER.
+
+    Es busca l'OID caIssuers (1.3.6.1.5.5.7.48.2) dins l'extensió Authority Information Access; just
+    després hi ha l'accessLocation, un GeneralName URI (etiqueta 0x86, una cadena IA5).
+    """
+    oid, urls, i = bytes.fromhex("2b06010505073002"), [], 0
+    while True:
+        i = der.find(oid, i)
+        if i < 0:
+            return urls
+        i += len(oid)
+        if der[i:i + 1] != b"\x86":
+            continue
+        n, j = der[i + 1], i + 2
+        if n & 0x80:  # longitud en forma llarga
+            k = n & 0x7F
+            n, j = int.from_bytes(der[j:j + k], "big"), j + k
+        urls.append(der[j:j + n].decode("ascii", "replace"))
+
+
+def _tlv(der, i):
+    """(etiqueta, inici del contingut, final) de l'element DER (TLV) que comença a la posició i."""
+    tag, n, j = der[i], der[i + 1], i + 2
+    if n & 0x80:  # longitud en forma llarga
+        k = n & 0x7F
+        n, j = int.from_bytes(der[j:j + k], "big"), j + k
+    return tag, j, j + n
+
+
+def is_self_issued(der):
+    """True si l'emissor i el subjecte del certificat (DER) coincideixen: és una arrel autosignada."""
+    _, i, _ = _tlv(der, 0)  # Certificate
+    _, i, _ = _tlv(der, i)  # tbsCertificate
+    if der[i] == 0xA0:  # [0] version (opcional)
+        _, _, i = _tlv(der, i)
+    _, _, i = _tlv(der, i)  # serialNumber
+    _, _, i = _tlv(der, i)  # signature
+    _, _, e = _tlv(der, i)  # issuer
+    issuer, i = der[i:e], e
+    _, _, i = _tlv(der, i)  # validity
+    _, _, e = _tlv(der, i)  # subject
+    return issuer == der[i:e]
+
+
+def download_ca(url, max_bytes=65536):
+    """Baixa un certificat de CA (DER o PEM) i el retorna com a PEM. Només http(s), mida limitada."""
+    if not re.match(r"https?://", url, re.I):
+        raise VraError(f"URL no admesa ({url}): només es baixa per http(s)")
+    try:
+        with urllib.request.urlopen(url, timeout=20) as r:
+            data = r.read(max_bytes + 1)
+    except (urllib.error.URLError, OSError) as e:
+        raise VraError(f"no puc baixar {url}: {getattr(e, 'reason', e)}")
+    if len(data) > max_bytes:
+        raise VraError(f"{url} és massa gran per ser un certificat")
+    text = data.decode("ascii", "ignore")
+    m = PEM_RE.search(text)
+    pem = m.group(0) + "\n" if m else ssl.DER_cert_to_PEM_cert(data)
+    try:  # comprova que és un certificat vàlid (no p.ex. un PKCS#7)
+        ssl.create_default_context().load_verify_locations(cadata=pem)
+        self_issued = is_self_issued(ssl.PEM_cert_to_DER_cert(pem))
+    except (ssl.SSLError, IndexError, ValueError):
+        raise VraError(f"{url} no és un certificat X.509 en DER ni PEM (potser un PKCS#7, no suportat)")
+    if self_issued:  # una arrel que vingui de la xarxa no es pot creure: ha de ser ja al sistema
+        raise VraError(f"{url} és una CA arrel (autosignada): només s'accepten certificats intermedis. "
+                       "L'arrel ha de ser ja a les CA del sistema (instal·leu 'ca-certificates').")
+    return pem
+
+
+def strict_chain_context():
+    """Context que només accepta cadenes que acaben en una arrel de les CA del sistema.
+
+    Python 3.13+ activa per defecte VERIFY_X509_PARTIAL_CHAIN, que faria que un intermedi afegit
+    valgués com a ancoratge per si sol; aquí es desactiva perquè la verificació de 'fetch-ca' no
+    depengui del que s'ha baixat.
+    """
+    ctx = ssl.create_default_context()
+    ctx.verify_flags &= ~getattr(ssl, "VERIFY_X509_PARTIAL_CHAIN", 0)
+    return ctx
+
+
+def tls_verifies(hostname, port, ctx):
+    """(True, '') si una connexió TLS a hostname:port es verifica amb ctx; (False, motiu) si no."""
+    try:
+        with socket.create_connection((hostname, port), timeout=15) as sock:
+            with ctx.wrap_socket(sock, server_hostname=hostname):
+                return True, ""
+    except ssl.SSLCertVerificationError as e:
+        return False, e.verify_message
+    except (OSError, ssl.SSLError) as e:
+        raise VraError(f"no puc connectar amb {hostname}:{port}: {e}")
+
+
+def fingerprint(pem):
+    return hashlib.sha256(ssl.PEM_cert_to_DER_cert(pem)).hexdigest().upper()
+
+
+def save_ca(path, pems):
+    """Afegeix els certificats al fitxer (sense duplicar els que ja hi són). Retorna els nous."""
+    existing = []
+    if os.path.exists(path):
+        with open(path) as f:
+            existing = [b.strip() for b in PEM_RE.findall(f.read())]
+    new = [p for p in pems if p.strip() not in existing]
+    os.makedirs(os.path.dirname(path) or ".", mode=0o700, exist_ok=True)
+    with open(path, "w") as f:
+        f.write("\n".join(existing + [p.strip() for p in new]) + "\n")
+    return new
+
+
+def cmd_fetch_ca(host, out):
+    """Baixa el certificat intermedi que el servidor no envia, el verifica i el desa.
+
+    1. Llegeix el certificat del servidor (públic; sense verificar, només per llegir-lo).
+    2. Mira a quin URL indica que hi ha el seu emissor (Authority Information Access) i el baixa.
+    3. Comprova que, amb aquest certificat afegit a les CA del sistema, el servidor es verifica de
+       debò (cadena completa fins a una arrel de confiança i nom del servidor): és la garantia que el
+       fitxer baixat per HTTP no s'ha manipulat. Si no es verifica, no es desa res.
+    """
+    hostname, _, port = host.partition(":")
+    port = int(port or 443)
+    out = os.path.expanduser(out or DEFAULT_CA_FILE)
+    ok, why = tls_verifies(hostname, port, make_ssl_context(None))
+    if ok:
+        say(f"No cal cap certificat addicional: {host} ja es verifica amb les CA actuals.")
+        return
+    say(f"{host} no es verifica amb les CA actuals ({why}). Busco el certificat que falta...")
+    leaf = ssl.get_server_certificate((hostname, port))  # sense verificar: només es llegeix
+    chain, current = [], leaf
+    for _ in range(3):  # intermedi, i si cal l'emissor de l'intermedi...
+        urls = der_aia_urls(ssl.PEM_cert_to_DER_cert(current))
+        if not urls and chain:
+            break  # no hi ha més emissors per baixar: la resta ha de venir de les CA del sistema
+        if not urls:
+            raise VraError("el certificat no indica d'on baixar el seu emissor (no té 'CA Issuers'); cal "
+                           "obtenir l'intermedi per un altre camí i indicar-lo amb --ca-file")
+        pem, errors = None, []
+        for url in urls:
+            try:
+                pem = download_ca(url)
+                chain.append((url, pem))
+                break
+            except VraError as e:
+                errors.append(str(e))
+        if pem is None:
+            raise VraError("; ".join(errors))
+        ctx = strict_chain_context()
+        ctx.load_verify_locations(cadata="".join(p for _, p in chain))
+        ok, why = tls_verifies(hostname, port, ctx)
+        if ok:
+            break
+        current = pem
+    if not ok:
+        raise VraError(f"he baixat {len(chain)} certificat(s) intermedi(s), però {host} continua sense "
+                       f"verificar-se ({why}). No es desa res. Si la cadena acaba en una arrel que el sistema "
+                       "no té, instal·leu el paquet 'ca-certificates'; si no, el servidor no és de fiar.")
+    added = save_ca(out, [p for _, p in chain])
+    for url, pem in chain:
+        say(f"  {'+' if pem in added else '='} SHA-256 {fingerprint(pem)}  (de {url})")
+    say(f"Verificat: amb aquest certificat, {host} es verifica contra les CA del sistema.")
+    say(f"Desat a {out}" + (" (ja hi era)" if not added else "") +
+        (". vractl el fa servir automàticament." if out == DEFAULT_CA_FILE else
+         f". Per fer-lo servir: --ca-file {out} o VRA_CA_FILE."))
+
+
 def cmd_login(vra, host):
     """Demana usuari i contrasenya al terminal, obté el token d'API i el desa. No desa la contrasenya."""
     if not sys.stdin.isatty():
@@ -534,6 +717,9 @@ def run():
     sub = ap.add_subparsers(dest="cmd", required=True)
     sub.add_parser("login", help="obté un token d'API amb usuari i contrasenya i el desa")
     sub.add_parser("check", help="comprova el token i la connexió (només lectura)")
+    sub.add_parser("fetch-ca", help="baixa i verifica el certificat intermedi que el servidor no envia"
+                   ).add_argument("--out", metavar="FITXER",
+                                  help=f"on desar-lo (defecte: {DEFAULT_CA_FILE}; vractl el carrega sol)")
     sub.add_parser("list")
     subs = {}
     for c in tuple(POWER_ACTIONS) + ("status", "snapshots"):
@@ -563,6 +749,8 @@ def run():
     if a.parallel < 1:
         sys.exit("--parallel ha de ser 1 o més.")
     host = normalize_host(a.host)
+    if a.cmd == "fetch-ca":
+        return cmd_fetch_ca(host, a.out)
     vra = Vra(host, make_ssl_context(a.ca_file), a.api_version,
               refresh_token=None if a.cmd == "login" else load_token())
 

@@ -86,22 +86,38 @@ El script **verifica el certificat del servidor**. Si el servidor no envia el ce
 com *"No es pot verificar el certificat del servidor"*. Solucions, per ordre de preferència:
 
 1. Que els administradors del servidor configurin la **cadena completa**.
-2. Indicar al script el certificat intermedi que falta: `--ca-file ruta.pem` o `VRA_CA_FILE`. El
-   fitxer (PEM) s'**afegeix** a les CA del sistema, no les substitueix, així que només cal l'intermedi.
-   L'URL per baixar-lo és al camp *Authority Information Access* del certificat del servidor:
+2. **`fetch-ca`**: baixa i verifica el certificat intermedi que falta, i el desa:
 
    ```bash
-   echo | openssl s_client -connect vra.example.org:443 -servername vra.example.org 2>/dev/null \
-     | openssl x509 -noout -ext authorityInfoAccess          # 'CA Issuers - URI:...'
-   mkdir -p ca && curl -o ca/intermedi.cer <URI>
-   openssl x509 -inform DER -in ca/intermedi.cer -out ca/intermedi.pem   # si és DER (si ja és PEM, copieu-lo)
-   # Comproveu-ho abans de fer-lo servir (la descàrrega és per HTTP; la verificació la valida):
-   echo | openssl s_client -connect vra.example.org:443 -servername vra.example.org 2>/dev/null \
-     | openssl x509 > fulla.pem && openssl verify -untrusted ca/intermedi.pem fulla.pem   # ha de dir OK
-   ./vractl.py -h vra.example.org --ca-file ca/intermedi.pem check
+   ./vractl.py -h vra.example.org fetch-ca
+   # vra.example.org no es verifica amb les CA actuals (unable to get local issuer certificate). Busco...
+   #   + SHA-256 AB12CD...  (de http://crt.example.org/intermedi.cer)
+   # Verificat: amb aquest certificat, vra.example.org es verifica contra les CA del sistema.
+   # Desat a ~/.config/vractl/ca.pem. vractl el fa servir automàticament.
    ```
 
-   Per no repetir-ho, definiu `VRA_CA_FILE` a l'entorn. El directori `ca/` està ignorat per git.
+   Es fa un cop per servidor i màquina. El fitxer `~/.config/vractl/ca.pem` es **carrega sempre**
+   (afegit a les CA del sistema, no les substitueix), així que no cal cap opció més. Si el servidor ja
+   es verifica, no fa res. Amb `--out FITXER` el desa on vulgueu (llavors cal `--ca-file FITXER` o
+   `VRA_CA_FILE`); si el fitxer ja existeix, hi **afegeix** el certificat sense esborrar el que hi
+   havia.
+
+   Com és segur, tot i que el certificat del servidor es llegeix sense verificar i l'intermedi es
+   baixa per HTTP (és el que indica el certificat, camp *Authority Information Access*):
+   - només es desa si, amb aquest certificat afegit, **OpenSSL verifica una connexió real** al servidor:
+     cadena completa fins a una **arrel de les CA del sistema**, i nom del servidor. Si no, no es desa
+     res;
+   - **es rebutgen** els certificats baixats que siguin **arrels** (autosignades): una arrel que
+     vingui de la xarxa no es pot creure, ha de ser ja al sistema;
+   - només es baixa per `http(s)://`, amb mida màxima de 64 KB;
+   - es mostra l'empremta SHA-256, per comparar-la si voleu.
+
+   Si el sistema no té les arrels (típic en contenidors mínims), falla amb un missatge que ho explica:
+   instal·leu el paquet `ca-certificates`.
+
+   *A mà*, sense `fetch-ca`: el fitxer PEM de l'intermedi es pot passar amb `--ca-file ruta.pem` o
+   `VRA_CA_FILE`; l'URL per baixar-lo és al camp *Authority Information Access* del certificat
+   (`openssl x509 -noout -ext authorityInfoAccess`).
 3. `VRA_INSECURE=1` desactiva la verificació (el script ho avisa a cada execució). **Només per
    proves:** el token s'envia sense comprovar qui hi ha a l'altre costat.
 
@@ -112,7 +128,7 @@ com *"No es pot verificar el certificat del servidor"*. Solucions, per ordre de 
 | `VRA_HOST` | Servidor (alternativa a `-h`). |
 | `VRA_TOKEN` | Token d'API. |
 | `VRA_TOKEN_FILE` | Fitxer amb el token (defecte: `~/.config/vractl/token`). |
-| `VRA_CA_FILE` | Certificats PEM addicionals de confiança, p.ex. un intermedi (alternativa a `--ca-file`). |
+| `VRA_CA_FILE` | Certificats PEM addicionals de confiança, p.ex. un intermedi (alternativa a `--ca-file`). A més, sempre es carrega `~/.config/vractl/ca.pem` si existeix (el desa `fetch-ca`). |
 | `VRA_INSECURE` | `1` desactiva la verificació TLS. **Només per proves.** |
 | `VRA_USER` | Usuari per a `login` (si no, el demana). |
 | `VRA_API_VERSION` | Versió de la IaaS API (defecte `2021-07-15`; alternativa a `--api-version`). |
