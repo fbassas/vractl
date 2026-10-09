@@ -209,9 +209,10 @@ Si un patró no coincideix amb cap VM, no es fa res.
 
 ### Snapshots: com a màxim 1 per VM
 
-La política de la plataforma és tenir **com a màxim 1 snapshot per VM** (per no penalitzar el
-rendiment); a les VMs creades des d'una plantilla, Aria Automation ho aplica amb la propietat
-`snapshotLimit` i rebutja un segon snapshot. Per això `snapshot` fa això, VM per VM:
+`vractl` manté **com a màxim 1 snapshot per VM**. Els snapshots acumulats penalitzen el rendiment
+de la VM, i Aria Automation pot limitar-ne el nombre (per exemple amb la propietat personalitzada
+`snapshotLimit`): quan se supera el límit, rebutja la creació amb un error com *«Exceeded number of
+snapshots»*. Per evitar-ho, `snapshot` fa això, VM per VM:
 
 1. **Mira si la VM ja té algun snapshot.**
 2. Si **no en té cap**, el crea (no pregunta res).
@@ -220,7 +221,7 @@ rendiment); a les VMs creades des d'una plantilla, Aria Automation ho aplica amb
 
 ```
 $ ./vractl.py snapshot web-prod abans-update
-web-prod (vm-0012) ja té 1 snapshot (la política és com a màxim 1 per VM):
+web-prod (vm-0012) ja té 1 snapshot (vractl en manté com a màxim 1 per VM):
   - 'antic', del 2026-01-15 (descripció)
 Esborrar-lo i crear-ne un de nou ('abans-update')? [s/N] s
 Esborrat el snapshot existent: 'antic', del 2026-01-15 (descripció)

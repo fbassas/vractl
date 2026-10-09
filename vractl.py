@@ -25,9 +25,10 @@ l'altra; amb --parallel N, fins a N alhora. També es poden seleccionar per patr
 coincideix amb el deployment o la VM; es pot repetir) o per fitxer (--vms-file, una VM per línia).
 Tot es pot combinar; van abans del subcomandament.
 
-Snapshots: la política de la plataforma és com a màxim 1 snapshot per VM. 'snapshot' mira si la VM
-ja en té: si no, el crea; si sí, en mostra el nom i la data i demana confirmació per esborrar-lo (amb
---yes no pregunta) i, un cop esborrat, crea el nou.
+Snapshots: vractl manté com a màxim 1 snapshot per VM (els snapshots acumulats penalitzen el
+rendiment, i Aria pot limitar-ne el nombre). 'snapshot' mira si la VM ja en té: si no, el crea; si
+sí, en mostra el nom i la data i demana confirmació per esborrar-lo (amb --yes no pregunta) i, un cop
+esborrat, crea el nou.
 
 Exemples:
   vractl.py -h vra.example.org login
@@ -419,9 +420,9 @@ def match_vm(vm, pattern):
     return any(fnmatch.fnmatchcase(vm.get(k) or "", pattern) for k in ("deploymentName", "name"))
 
 
-# Política de la plataforma: com a màxim 1 snapshot per VM (per no penalitzar el rendiment).
-# Per això 'snapshot' no pot afegir-ne un de nou si ja n'hi ha un: cal esborrar l'existent
-# abans, i només amb confirmació de l'usuari.
+# vractl manté com a màxim 1 snapshot per VM (rendiment; Aria pot rebutjar-ne més d'un). Per això
+# 'snapshot' no n'afegeix un de nou si ja n'hi ha un: cal esborrar l'existent abans, i només amb
+# confirmació de l'usuari.
 def describe_snapshot(snap):
     """'nom', del AAAA-MM-DD (descripció)"""
     desc = (snap.get("description") or "").strip()
@@ -454,13 +455,13 @@ def plan_snapshots(vra, vms, new_name, assume_yes):
     if not sys.stdin.isatty():
         lines = [f"  - {vm_label(by_id[i])}: " + "; ".join(describe_snapshot(s) for s in snaps)
                  for i, snaps in existing.items()]
-        sys.exit("Aquestes VMs ja tenen snapshot (la política és com a màxim 1 per VM), i caldria esborrar-lo "
+        sys.exit("Aquestes VMs ja tenen snapshot (vractl en manté com a màxim 1 per VM), i caldria esborrar-lo "
                  "abans de crear-ne un de nou:\n" + "\n".join(lines) +
                  "\nNo hi ha terminal per confirmar-ho: useu --yes per esborrar-los i continuar.")
     to_delete, skipped = {}, set()
     for i, snaps in existing.items():
         n = len(snaps)
-        print(f"{vm_label(by_id[i])} ja té {n} snapshot{'s' if n > 1 else ''} (la política és com a màxim 1 per VM):")
+        print(f"{vm_label(by_id[i])} ja té {n} snapshot{'s' if n > 1 else ''} (vractl en manté com a màxim 1 per VM):")
         for s in snaps:
             print(f"  - {describe_snapshot(s)}")
         q = (f"Esborrar-lo i crear-ne un de nou ('{new_name}')? [s/N] " if n == 1 else
