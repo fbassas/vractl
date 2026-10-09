@@ -132,6 +132,50 @@ com *"No es pot verificar el certificat del servidor"*. Solucions, per ordre de 
 | `VRA_INSECURE` | `1` desactiva la verificació TLS. **Només per proves.** |
 | `VRA_USER` | Usuari per a `login` (si no, el demana). |
 | `VRA_API_VERSION` | Versió de la IaaS API (defecte `2021-07-15`; alternativa a `--api-version`). |
+| `HTTPS_PROXY` | Proxy HTTP pel qual passar (vegeu *Accés des de fora de la xarxa permesa*). |
+
+### Accés des de fora de la xarxa permesa (VPN, tallafoc)
+
+Alguns serveis d'Aria Automation només accepten peticions des d'una xarxa concreta (per exemple, la de
+la VPN de l'organització). Des d'una altra xarxa, la connexió TLS s'estableix, però un tallafoc o proxy
+davant del servei respon amb un **`403` amb una pàgina HTML** en lloc de la resposta JSON d'Aria. `vractl`
+ho reconeix i ho diu (*«resposta HTML … que no és d'Aria Automation»*); no és un error de credencials.
+
+Per confirmar-ho des de la màquina que falla (no envia cap credencial):
+
+```bash
+H=https://vra.example.org
+curl -sSk -o /dev/null -w "about:      %{http_code}\n" $H/iaas/api/about
+curl -sSk -o /dev/null -w "csp login:  %{http_code}\n" -X POST "$H/csp/gateway/am/api/login?access_token" -H 'Content-Type: application/json' -d '{}'
+curl -sSk -o /dev/null -w "iaas login: %{http_code}\n" -X POST $H/iaas/api/login -H 'Content-Type: application/json' -d '{"refreshToken":"x"}'
+```
+
+Des d'una xarxa permesa, `about` dona `200` i els altres dos un error JSON (`400`/`401`); des d'una
+bloquejada, tots donen `403` amb HTML. Què es pot fer:
+
+1. **Que permetin l'IP d'origen** de la màquina. És el que cal per a un servidor que ha de funcionar
+   sempre (cron).
+2. **Executar `vractl` des d'una màquina que ja tingui accés** (p.ex. connectada a la VPN).
+3. **Passar per un proxy HTTP** d'una màquina que sí que hi tingui accés. `vractl` fa servir la
+   variable `HTTPS_PROXY` (la llegeix la biblioteca estàndard de Python):
+
+   ```bash
+   export HTTPS_PROXY=http://maquina-vpn:3128
+   ./vractl.py -h vra.example.org check
+   ```
+
+   El proxy ha de ser un proxy HTTP que accepti `CONNECT` (p.ex. `tinyproxy` o `squid`) i **només
+   hauria d'escoltar en una IP interna**, perquè si no seria un proxy obert. El TLS continua anant de
+   punta a punta amb el servidor (el certificat es verifica igual): el proxy només veu el nom del
+   servidor i el port, no el token ni les dades. S'ha provat amb un proxy local de prova contra el
+   servidor real (consulta pública), **no** des d'una xarxa bloquejada de debò.
+4. **Copiar el token** d'una màquina on ja funciona (`scp ~/.config/vractl/token` a l'altra, amb
+   permisos `600`), si el bloqueig només afecta el `login` amb usuari i contrasenya. És una credencial:
+   copieu-la només entre màquines vostres.
+
+`fetch-ca` es connecta **directament** al servidor (no pel proxy) i baixa l'intermedi de la URL del
+certificat per HTTP (honra `HTTP_PROXY`, no `HTTPS_PROXY`). Si des d'una màquina no hi pot accedir,
+genereu `~/.config/vractl/ca.pem` en una on funcioni i copieu-lo.
 
 ## Ús
 
