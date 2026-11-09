@@ -706,6 +706,47 @@ def cmd_login(vra, host):
     print(f"Token d'API desat a {path} (permisos 600). Caduca als 90 dies.")
 
 
+# Exemples que es mostren sense ordre o amb '-h' sol. Mantenir-los iguals que el primer bloc de
+# la secció «Ús» del README.
+EXAMPLES = """vractl - gestiona VMs de VMware Aria Automation (start/stop/snapshot...)
+
+Ús (les VMs, pel nom del deployment; 'list' les mostra):
+
+./vractl.py list                                   # totes les VMs que veieu, per deployment
+./vractl.py status web01                           # estat d'una VM (pel nom del deployment)
+
+./vractl.py start web01                            # arrencar
+./vractl.py shutdown web01                         # aturada neta (cal VMware Tools)
+./vractl.py stop web01                             # aturada dura (power-off)
+./vractl.py reboot web01
+./vractl.py reset web01                            # reset dur
+./vractl.py suspend web01
+./vractl.py resume web01                           # = arrencar una VM suspesa
+
+./vractl.py snapshot web01 pre-update --desc "abans d'actualitzar"
+./vractl.py snapshot web01 amb-ram --memory        # inclou la memòria (per defecte NO)
+./vractl.py snapshots web01                        # llistar, amb id (* = snapshot actual)
+./vractl.py rollback web01 pre-update              # revertir
+./vractl.py delsnap web01 pre-update               # esborrar
+
+Servidor:  -h SERVIDOR (o la variable VRA_HOST)      Primer cop: login (o un token) i, si cal, fetch-ca
+Opcions globals (abans de l'ordre):  --match 'patró'  --vms-file FITXER  --parallel N  --yes  --no-wait
+Totes les opcions: ./vractl.py --help        Documentació completa: README.md"""
+
+
+class Parser(argparse.ArgumentParser):
+    """Parser que, si no hi ha cap ordre o es posa només '-h', mostra els exemples d'ús."""
+
+    def error(self, message):
+        if message.startswith("argument -h/--host: expected one argument"):  # «-h» sol: demanar ajuda
+            print(EXAMPLES)
+            sys.exit(0)
+        if "required: cmd" in message:  # cap ordre
+            print(EXAMPLES, file=sys.stderr)
+            sys.exit(2)
+        super().error(message)
+
+
 def main():
     try:
         run()
@@ -715,7 +756,7 @@ def main():
 
 def run():
     # add_help=False: el -h queda lliure per al servidor (l'ajuda és --help)
-    ap = argparse.ArgumentParser(description="Gestió de VMs d'Aria Automation", add_help=False)
+    ap = Parser(description="Gestió de VMs d'Aria Automation", add_help=False)
     ap.add_argument("--help", action="help", help="mostra aquesta ajuda i surt")
     ap.add_argument("-h", "--host", metavar="HOST", help="servidor d'Aria Automation (o VRA_HOST)")
     ap.add_argument("--ca-file", metavar="FITXER",
